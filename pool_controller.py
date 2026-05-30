@@ -228,8 +228,9 @@ def control_loop():
             elif time.time() - state["sensor_unavailable_since"] > SENSOR_UNAVAILABLE_TIMEOUT:
                 log.error("Sensor unavailable > 3 min — forcing heater off")
                 set_heater_relay(False)
-            # Publish unavailable state
+            # Publish full state including unavailable temp
             mqtt_client.publish("pool/sensor/water_temp", "unavailable", retain=True)
+            publish_state()
             update_display()
 
         else:
@@ -240,7 +241,7 @@ def control_loop():
 
             state["water_temp"] = temp
 
-            # Hysteresis logic
+            # Hysteresis logic — set_heater_relay() handles publish and display
             if state["heater_enabled"]:
                 if temp < (state["setpoint"] - HYSTERESIS):
                     set_heater_relay(True)
@@ -250,6 +251,7 @@ def control_loop():
             else:
                 set_heater_relay(False)
 
+            # Always publish temp and display update each loop tick
             publish_state()
             update_display()
 
