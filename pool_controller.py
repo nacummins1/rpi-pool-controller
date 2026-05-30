@@ -25,6 +25,7 @@ import json
 import threading
 import logging
 import glob
+import os
 
 import RPi.GPIO as GPIO
 import paho.mqtt.client as mqtt
@@ -68,6 +69,9 @@ HYSTERESIS                 = 2.0   # ±2°F band
 # Stage 3 — set to True when valve actuators are physically connected
 VALVE_ACTUATORS_CONNECTED = False
 
+# Persistent state file — survives reboots
+STATE_FILE = "/home/pi/pool_state.json"
+
 # -------------------------------------------------------
 # GPIO Pin Assignments
 # -------------------------------------------------------
@@ -105,6 +109,38 @@ state = {
 
 mqtt_client = mqtt.Client()
 mqtt_connected = False
+
+# -------------------------------------------------------
+# Persistent State
+# -------------------------------------------------------
+
+def save_state():
+    """Save persistent state to disk — survives reboots."""
+    data = {
+        "setpoint":       state["setpoint"],
+        "heater_enabled": state["heater_enabled"],
+        "valve_position": state["valve_position"],
+    }
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        log.warning(f"Failed to save state: {e}")
+
+def load_state():
+    """Load persistent state from disk on startup."""
+    if not os.path.exists(STATE_FILE):
+        log.info("No saved state found — using defaults")
+        return
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+        state["setpoint"]       = float(data.get("setpoint", SETPOINT_DEFAULT))
+        state["heater_enabled"] = bool(data.get("heater_enabled", False))
+        state["valve_position"] = data.get("valve_position", "pool")
+        log.info(f"State restored: setpoint={state['setpoint']}, heater={state['heater_enabled']}, valve={state['valve_position']}")
+    except Exception as e:
+        log.warning(f"Failed to load state: {e}")
 
 # -------------------------------------------------------
 # Temperature Sensor
@@ -145,9 +181,7 @@ def read_temperature():
 # -------------------------------------------------------
 
 def set_heater_relay(on: bool):
-    """Set heater relay state. No-op if state unchanged."""
-    if state["heater_relay_on"] == on:
-        return
+    """Set heater relay state. Always writes to GPIO to prevent sync issues."""
     state["heater_relay_on"] = on
     GPIO.output(PIN_HEATER_RELAY, GPIO.HIGH if on else GPIO.LOW)
     log.info(f"Heater relay: {'ON' if on else 'OFF'}")
@@ -173,6 +207,7 @@ def set_valve(position: str):
     else:
         log.info("Valve actuators not connected — software state only")
 
+    save_state()
     publish_state()
     update_display()
 
@@ -320,6 +355,7 @@ def on_message(client, userdata, msg):
         state["heater_enabled"] = (payload == "ON")
         if not state["heater_enabled"]:
             set_heater_relay(False)
+        save_state()
         publish_state()
         update_display()
 
@@ -327,6 +363,7 @@ def on_message(client, userdata, msg):
         try:
             val = float(payload)
             state["setpoint"] = max(SETPOINT_MIN, min(SETPOINT_MAX, val))
+            save_state()
             publish_state()
             update_display()
         except ValueError:
@@ -507,6 +544,7 @@ def encoder_callback(channel):
 
     _last_clk_state = clk_state
     log.info(f"Setpoint adjusted to {state['setpoint']}°F")
+    save_state()
     publish_state()
     update_display()
 
@@ -516,6 +554,7 @@ def encoder_sw_callback(channel):
     if not state["heater_enabled"]:
         set_heater_relay(False)
     log.info(f"Heater toggled: {'ON' if state['heater_enabled'] else 'OFF'}")
+    save_state()
     publish_state()
     update_display()
 
@@ -541,6 +580,9 @@ def main():
     global _last_clk_state
 
     log.info("Pool Controller starting...")
+
+    # Load saved state
+    load_state()
 
     # GPIO
     setup_gpio()
