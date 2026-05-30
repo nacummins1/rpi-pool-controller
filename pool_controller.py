@@ -224,9 +224,11 @@ def control_loop():
             if state["sensor_unavailable_since"] is None:
                 state["sensor_unavailable_since"] = time.time()
                 log.warning("Temp sensor unavailable — watchdog started")
-            elif time.time() - state["sensor_unavailable_since"] > SENSOR_UNAVAILABLE_TIMEOUT:
+            elif state["sensor_unavailable_since"] != -1 and \
+                 time.time() - state["sensor_unavailable_since"] > SENSOR_UNAVAILABLE_TIMEOUT:
                 log.error("Sensor unavailable > 3 min — forcing heater off")
                 set_heater_relay(False)
+                state["sensor_unavailable_since"] = -1  # Watchdog fired — don't repeat
             # Publish full state including unavailable temp
             mqtt_client.publish("pool/sensor/water_temp", "unavailable", retain=True)
             publish_state()
