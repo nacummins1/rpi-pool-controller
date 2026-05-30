@@ -181,12 +181,11 @@ def read_temperature():
 # -------------------------------------------------------
 
 def set_heater_relay(on: bool):
-    """Set heater relay state. Always writes to GPIO to prevent sync issues."""
+    """Set heater relay state. Always writes to GPIO to prevent sync issues.
+    Caller is responsible for publish_state() and update_display()."""
     state["heater_relay_on"] = on
     GPIO.output(PIN_HEATER_RELAY, GPIO.HIGH if on else GPIO.LOW)
     log.info(f"Heater relay: {'ON' if on else 'OFF'}")
-    publish_state()
-    update_display()
 
 def set_valve(position: str):
     """
