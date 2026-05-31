@@ -237,6 +237,7 @@ def _monitor_encoder():
             for event in enc_lines.read_edge_events():
                 if event.line_offset == PIN_ENCODER_CLK:
                     dt = enc_lines.get_value(PIN_ENCODER_DT) == Value.ACTIVE
+                    log.info(f"Encoder CLK event, DT={dt}")
                     if dt:
                         encoder_cw()
                     else:
