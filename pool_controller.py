@@ -49,7 +49,7 @@ log = logging.getLogger("pool")
 # Configuration
 # -------------------------------------------------------
 
-BROKER_IP   = "172.30.33.1"
+BROKER_IP   = "192.168.1.13"
 BROKER_PORT = 1883
 BROKER_USER = "mqtt"
 BROKER_PASS = "codex123"
