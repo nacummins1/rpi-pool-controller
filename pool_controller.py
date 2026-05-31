@@ -211,7 +211,7 @@ def _set_output(pin: int, value: bool):
     _output_lines.set_value(pin, Value.ACTIVE if value else Value.INACTIVE)
 
 def _monitor_encoder():
-    """Monitor rotary encoder CLK/DT and SW pins using edge detection."""
+    """Monitor rotary encoder using DT edge to determine direction before CLK settles."""
     with gpiod.request_lines(
         GPIO_CHIP,
         consumer="pool-encoder",
@@ -222,8 +222,9 @@ def _monitor_encoder():
                 debounce_period=datetime.timedelta(milliseconds=3)
             ),
             PIN_ENCODER_DT: gpiod.LineSettings(
-                direction=Direction.INPUT,
+                edge_detection=Edge.FALLING,
                 bias=Bias.PULL_UP,
+                debounce_period=datetime.timedelta(milliseconds=3)
             ),
             PIN_ENCODER_SW: gpiod.LineSettings(
                 edge_detection=Edge.FALLING,
@@ -233,16 +234,25 @@ def _monitor_encoder():
         }
     ) as enc_lines:
         log.info("Encoder monitoring started")
+        last_clk_time = 0
+        last_dt_time  = 0
+
         while True:
             for event in enc_lines.read_edge_events():
+                now = time.monotonic()
+
                 if event.line_offset == PIN_ENCODER_CLK:
-                    # Sample DT multiple times and use majority vote
-                    dt_reads = [enc_lines.get_value(PIN_ENCODER_DT) == Value.ACTIVE for _ in range(5)]
-                    dt = sum(dt_reads) > 2  # True if majority are ACTIVE
-                    if dt:
-                        encoder_cw()
-                    else:
+                    # CLK fell — if DT fell recently before CLK, it's CCW
+                    # if DT hasn't fallen yet, it's CW
+                    if (now - last_dt_time) < 0.05:
                         encoder_ccw()
+                    else:
+                        encoder_cw()
+                    last_clk_time = now
+
+                elif event.line_offset == PIN_ENCODER_DT:
+                    last_dt_time = now
+
                 elif event.line_offset == PIN_ENCODER_SW:
                     encoder_sw_callback()
 
