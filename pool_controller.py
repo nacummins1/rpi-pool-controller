@@ -211,14 +211,15 @@ def _set_output(pin: int, value: bool):
     _output_lines.set_value(pin, Value.ACTIVE if value else Value.INACTIVE)
 
 def _monitor_encoder():
-    """Monitor rotary encoder by polling CLK/DT pins in a tight loop."""
+    """Monitor rotary encoder CLK/DT and SW pins using edge detection."""
     with gpiod.request_lines(
         GPIO_CHIP,
         consumer="pool-encoder",
         config={
             PIN_ENCODER_CLK: gpiod.LineSettings(
-                direction=Direction.INPUT,
+                edge_detection=Edge.FALLING,
                 bias=Bias.PULL_UP,
+                debounce_period=datetime.timedelta(milliseconds=3)
             ),
             PIN_ENCODER_DT: gpiod.LineSettings(
                 direction=Direction.INPUT,
@@ -232,29 +233,18 @@ def _monitor_encoder():
         }
     ) as enc_lines:
         log.info("Encoder monitoring started")
-        last_clk = enc_lines.get_value(PIN_ENCODER_CLK) == Value.ACTIVE
-        last_sw_time = 0
-
         while True:
-            # Check button via edge event (non-blocking)
-            events = enc_lines.read_edge_events(max_wait_time=datetime.timedelta(milliseconds=1))
-            for event in events:
-                if event.line_offset == PIN_ENCODER_SW:
-                    encoder_sw_callback()
-
-            # Poll CLK and DT for rotation
-            clk = enc_lines.get_value(PIN_ENCODER_CLK) == Value.ACTIVE
-            dt  = enc_lines.get_value(PIN_ENCODER_DT)  == Value.ACTIVE
-
-            if clk != last_clk:
-                if not clk:  # CLK just went LOW (falling edge)
+            for event in enc_lines.read_edge_events():
+                if event.line_offset == PIN_ENCODER_CLK:
+                    # Sample DT multiple times and use majority vote
+                    dt_reads = [enc_lines.get_value(PIN_ENCODER_DT) == Value.ACTIVE for _ in range(5)]
+                    dt = sum(dt_reads) > 2  # True if majority are ACTIVE
                     if dt:
                         encoder_cw()
                     else:
                         encoder_ccw()
-                last_clk = clk
-
-            time.sleep(0.001)  # 1ms poll interval
+                elif event.line_offset == PIN_ENCODER_SW:
+                    encoder_sw_callback()
 
 def _monitor_buttons():
     """Monitor Pool and Spa buttons using edge detection."""
