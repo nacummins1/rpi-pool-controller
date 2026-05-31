@@ -242,9 +242,9 @@ def _monitor_encoder():
                     dt  = enc_lines.get_value(PIN_ENCODER_DT) == Value.ACTIVE
                     if clk != last_clk:
                         if clk != dt:
-                            encoder_cw()
-                        else:
                             encoder_ccw()
+                        else:
+                            encoder_cw()
                         last_clk = clk
                 elif event.line_offset == PIN_ENCODER_SW:
                     encoder_sw_callback()
