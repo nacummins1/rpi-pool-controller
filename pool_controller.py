@@ -56,7 +56,7 @@ BROKER_PORT = 1883
 BROKER_USER = "mqtt"
 BROKER_PASS = "codex123"
 
-TEMP_SENSOR_PATH = "/sys/bus/w1/devices/28-XXXXXXXXXXXX/w1_slave"
+TEMP_SENSOR_PATH = "/sys/bus/w1/devices/28-00000025218c/w1_slave"
 
 SETPOINT_MIN     = 65.0
 SETPOINT_MAX     = 104.0
