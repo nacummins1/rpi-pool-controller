@@ -107,7 +107,7 @@ state = {
 # MQTT Client
 # -------------------------------------------------------
 
-mqtt_client = mqtt.Client()
+mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 mqtt_connected = False
 
 # -------------------------------------------------------
@@ -378,23 +378,23 @@ def on_message(client, userdata, msg):
         else:
             log.warning(f"Invalid valve command: {payload}")
 
-def on_connect(client, userdata, flags, rc):
+def on_connect(client, userdata, flags, reason_code, properties):
     """Called when MQTT connection is established."""
     global mqtt_connected
-    if rc == 0:
+    if reason_code == 0:
         mqtt_connected = True
         log.info(f"Connected to MQTT broker at {BROKER_IP}:{BROKER_PORT}")
         client.subscribe("pool/cmd/#")
         publish_discovery()
         publish_state()
     else:
-        log.error(f"MQTT connection failed, rc={rc}")
+        log.error(f"MQTT connection failed, reason={reason_code}")
 
-def on_disconnect(client, userdata, rc):
+def on_disconnect(client, userdata, flags, reason_code, properties):
     """Called when MQTT connection is lost."""
     global mqtt_connected
     mqtt_connected = False
-    log.warning(f"MQTT disconnected, rc={rc} — will retry")
+    log.warning(f"MQTT disconnected, reason={reason_code} — will retry")
 
 # -------------------------------------------------------
 # OLED Display
@@ -499,9 +499,9 @@ def setup_gpio():
 
     # Interrupts — rotary encoder
     GPIO.add_event_detect(
-        PIN_ENCODER_CLK, GPIO.BOTH,
+        PIN_ENCODER_CLK, GPIO.FALLING,
         callback=encoder_callback,
-        bouncetime=5
+        bouncetime=50
     )
     GPIO.add_event_detect(
         PIN_ENCODER_SW, GPIO.FALLING,
@@ -527,25 +527,15 @@ def setup_gpio():
 # Rotary Encoder Callbacks
 # -------------------------------------------------------
 
-_last_clk_state = None
-
 def encoder_callback(channel):
     """Handle rotary encoder rotation — adjust setpoint."""
-    global _last_clk_state
-    clk_state = GPIO.input(PIN_ENCODER_CLK)
-    dt_state  = GPIO.input(PIN_ENCODER_DT)
-
-    if clk_state == _last_clk_state:
-        return  # No change
-
-    if dt_state != clk_state:
+    dt_state = GPIO.input(PIN_ENCODER_DT)
+    if dt_state == GPIO.HIGH:
         # Clockwise — increase setpoint
         state["setpoint"] = min(SETPOINT_MAX, state["setpoint"] + 1)
     else:
         # Counterclockwise — decrease setpoint
         state["setpoint"] = max(SETPOINT_MIN, state["setpoint"] - 1)
-
-    _last_clk_state = clk_state
     log.info(f"Setpoint adjusted to {state['setpoint']}°F")
     save_state()
     publish_state()
@@ -580,8 +570,6 @@ def btn_spa_pressed(channel):
 # -------------------------------------------------------
 
 def main():
-    global _last_clk_state
-
     log.info("Pool Controller starting...")
 
     # Load saved state
@@ -589,7 +577,6 @@ def main():
 
     # GPIO
     setup_gpio()
-    _last_clk_state = GPIO.input(PIN_ENCODER_CLK)
 
     # OLED
     init_display()
