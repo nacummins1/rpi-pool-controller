@@ -202,6 +202,7 @@ def setup_gpio():
 
     # Start input monitoring threads for buttons and encoder
     threading.Thread(target=_monitor_encoder, daemon=True).start()
+    threading.Thread(target=_monitor_encoder_sw, daemon=True).start()
     threading.Thread(target=_monitor_buttons, daemon=True).start()
 
     log.info("GPIO initialized")
@@ -211,7 +212,7 @@ def _set_output(pin: int, value: bool):
     _output_lines.set_value(pin, Value.ACTIVE if value else Value.INACTIVE)
 
 def _monitor_encoder():
-    """Monitor rotary encoder using DT edge to determine direction before CLK settles."""
+    """Monitor rotary encoder CLK/DT using edge detection."""
     with gpiod.request_lines(
         GPIO_CHIP,
         consumer="pool-encoder",
@@ -226,35 +227,41 @@ def _monitor_encoder():
                 bias=Bias.PULL_UP,
                 debounce_period=datetime.timedelta(milliseconds=3)
             ),
+        }
+    ) as enc_lines:
+        log.info("Encoder monitoring started")
+        last_clk_time = 0
+        last_dt_time  = 0
+        while True:
+            for event in enc_lines.read_edge_events():
+                now = time.monotonic()
+                if event.line_offset == PIN_ENCODER_CLK:
+                    if (now - last_dt_time) < 0.05:
+                        encoder_cw()
+                    else:
+                        encoder_ccw()
+                    last_clk_time = now
+                elif event.line_offset == PIN_ENCODER_DT:
+                    last_dt_time = now
+
+def _monitor_encoder_sw():
+    """Monitor encoder push button separately."""
+    with gpiod.request_lines(
+        GPIO_CHIP,
+        consumer="pool-encoder-sw",
+        config={
             PIN_ENCODER_SW: gpiod.LineSettings(
                 edge_detection=Edge.FALLING,
                 bias=Bias.PULL_UP,
                 debounce_period=datetime.timedelta(milliseconds=300)
             ),
         }
-    ) as enc_lines:
-        log.info("Encoder monitoring started")
-        last_clk_time = 0
-        last_dt_time  = 0
-
+    ) as sw_lines:
+        log.info("Encoder button monitoring started")
         while True:
-            for event in enc_lines.read_edge_events():
-                now = time.monotonic()
-
-                if event.line_offset == PIN_ENCODER_CLK:
-                    # CLK fell — if DT fell recently before CLK, it's CW
-                    # if DT hasn't fallen yet, it's CCW
-                    if (now - last_dt_time) < 0.05:
-                        encoder_cw()
-                    else:
-                        encoder_ccw()
-                    last_clk_time = now
-
-                elif event.line_offset == PIN_ENCODER_DT:
-                    last_dt_time = now
-
-                elif event.line_offset == PIN_ENCODER_SW:
-                    encoder_sw_callback()
+            for event in sw_lines.read_edge_events():
+                log.info("Encoder button pressed")
+                encoder_sw_callback()
 
 def _monitor_buttons():
     """Monitor Pool and Spa buttons using edge detection."""
