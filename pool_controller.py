@@ -219,7 +219,6 @@ def _monitor_encoder():
             PIN_ENCODER_CLK: gpiod.LineSettings(
                 edge_detection=Edge.FALLING,
                 bias=Bias.PULL_UP,
-                debounce_period=datetime.timedelta(milliseconds=2)
             ),
             PIN_ENCODER_DT: gpiod.LineSettings(
                 direction=Direction.INPUT,
@@ -233,11 +232,16 @@ def _monitor_encoder():
         }
     ) as enc_lines:
         log.info("Encoder monitoring started")
+        last_time = 0
         while True:
             for event in enc_lines.read_edge_events():
                 if event.line_offset == PIN_ENCODER_CLK:
+                    # Software debounce — ignore events faster than 5ms
+                    now = time.monotonic()
+                    if now - last_time < 0.005:
+                        continue
+                    last_time = now
                     dt = enc_lines.get_value(PIN_ENCODER_DT) == Value.ACTIVE
-                    log.info(f"Encoder CLK event, DT={dt}")
                     if dt:
                         encoder_cw()
                     else:
