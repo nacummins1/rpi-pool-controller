@@ -217,14 +217,13 @@ def _monitor_encoder():
         consumer="pool-encoder",
         config={
             PIN_ENCODER_CLK: gpiod.LineSettings(
-                edge_detection=Edge.BOTH,
+                edge_detection=Edge.FALLING,
                 bias=Bias.PULL_UP,
-                debounce_period=datetime.timedelta(milliseconds=1)
+                debounce_period=datetime.timedelta(milliseconds=2)
             ),
             PIN_ENCODER_DT: gpiod.LineSettings(
-                edge_detection=Edge.BOTH,
+                direction=Direction.INPUT,
                 bias=Bias.PULL_UP,
-                debounce_period=datetime.timedelta(milliseconds=1)
             ),
             PIN_ENCODER_SW: gpiod.LineSettings(
                 edge_detection=Edge.FALLING,
@@ -234,18 +233,14 @@ def _monitor_encoder():
         }
     ) as enc_lines:
         log.info("Encoder monitoring started")
-        last_clk = None
         while True:
             for event in enc_lines.read_edge_events():
                 if event.line_offset == PIN_ENCODER_CLK:
-                    clk = event.event_type == gpiod.EdgeEvent.Type.RISING_EDGE
-                    dt  = enc_lines.get_value(PIN_ENCODER_DT) == Value.ACTIVE
-                    if clk != last_clk:
-                        if clk != dt:
-                            encoder_ccw()
-                        else:
-                            encoder_cw()
-                        last_clk = clk
+                    dt = enc_lines.get_value(PIN_ENCODER_DT) == Value.ACTIVE
+                    if dt:
+                        encoder_ccw()
+                    else:
+                        encoder_cw()
                 elif event.line_offset == PIN_ENCODER_SW:
                     encoder_sw_callback()
 
