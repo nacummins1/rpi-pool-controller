@@ -27,6 +27,9 @@ import logging
 import glob
 import os
 
+# Force gpiozero to use lgpio pin factory
+os.environ.setdefault("GPIOZERO_PIN_FACTORY", "lgpio")
+
 from gpiozero import OutputDevice, Button, RotaryEncoder
 import paho.mqtt.client as mqtt
 from luma.core.interface.serial import i2c

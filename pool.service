@@ -8,6 +8,7 @@ ExecStart=/usr/bin/python3 /home/pi/pool_controller.py
 Restart=always
 RestartSec=10
 User=pi
+Environment=GPIOZERO_PIN_FACTORY=lgpio
 StandardOutput=journal
 StandardError=journal
 
