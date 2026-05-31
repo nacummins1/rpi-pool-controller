@@ -458,7 +458,7 @@ def on_disconnect(client, userdata, flags, reason_code, properties):
 
 try:
     font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
-    font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 19)
+    font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
 except IOError:
     font_small = ImageFont.load_default()
     font_large = ImageFont.load_default()
@@ -490,8 +490,8 @@ def update_display():
     heater_str  = "ON"  if state["heater_enabled"]  else "OFF"
     heating_str = "YES" if state["heater_relay_on"] else "NO"
     status_text = f"Heater:{heater_str}  Heat:{heating_str}"
-    current  = f"{state['water_temp']:.0f}\u00b0F" if state["water_temp"] is not None else "---\u00b0F"
-    setpoint = f"{state['setpoint']:.0f}\u00b0F"
+    current  = f"{state['water_temp']:.0f}\u00b0" if state["water_temp"] is not None else "---\u00b0"
+    setpoint = f"{state['setpoint']:.0f}\u00b0"
 
     # Calculate positions for split temp line
     cur_w  = font_large.getbbox(current)[2]
