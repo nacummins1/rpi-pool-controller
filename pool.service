@@ -7,8 +7,7 @@ Wants=network-online.target
 ExecStart=/usr/bin/python3 /home/pi/pool_controller.py
 Restart=always
 RestartSec=10
-User=root
-Environment=GPIOZERO_PIN_FACTORY=lgpio
+User=pi
 StandardOutput=journal
 StandardError=journal
 
