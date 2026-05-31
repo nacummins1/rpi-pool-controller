@@ -26,6 +26,7 @@ import threading
 import logging
 import glob
 import os
+import datetime
 import gpiod
 from gpiod.line import Direction, Value, Edge, Bias
 
@@ -249,7 +250,6 @@ def _monitor_encoder():
 
 def _monitor_buttons():
     """Monitor Pool and Spa buttons using edge detection."""
-    import datetime
     with gpiod.request_lines(
         GPIO_CHIP,
         consumer="pool-buttons",
@@ -526,7 +526,6 @@ def btn_spa_pressed():
 # -------------------------------------------------------
 
 def main():
-    import datetime
     log.info("Pool Controller starting...")
     load_state()
     setup_gpio()
