@@ -458,7 +458,7 @@ def on_disconnect(client, userdata, flags, reason_code, properties):
 
 try:
     font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
-    font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+    font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 19)
 except IOError:
     font_small = ImageFont.load_default()
     font_large = ImageFont.load_default()
