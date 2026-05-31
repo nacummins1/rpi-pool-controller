@@ -490,14 +490,26 @@ def update_display():
     heater_str  = "ON"  if state["heater_enabled"]  else "OFF"
     heating_str = "YES" if state["heater_relay_on"] else "NO"
     status_text = f"Heater:{heater_str}  Heat:{heating_str}"
-    current     = f"{state['water_temp']:.1f}\u00b0F" if state["water_temp"] is not None else "---\u00b0F"
-    setpoint    = f"{state['setpoint']:.1f}\u00b0F"
-    temp_text   = f"{current} \u2192 {setpoint}"
+    current  = f"{state['water_temp']:.1f}\u00b0F" if state["water_temp"] is not None else "---\u00b0F"
+    setpoint = f"{state['setpoint']:.1f}\u00b0F"
+
+    # Calculate positions for split temp line
+    cur_w  = font_large.getbbox(current)[2]
+    set_w  = font_large.getbbox(setpoint)[2]
+    arr_w  = font_small.getbbox("\u2192")[2]
+    total_w = cur_w + arr_w + set_w + 6  # 3px padding each side of arrow
+    start_x = max(0, (128 - total_w) // 2)
+    cur_x  = start_x
+    arr_x  = cur_x + cur_w + 3
+    set_x  = arr_x + arr_w + 3
+
     try:
         with canvas(display_device) as draw:
             draw.text((center_x(mode_text,   font_small), 0),  mode_text,   font=font_small, fill="white")
             draw.text((center_x(status_text, font_small), 14), status_text, font=font_small, fill="white")
-            draw.text((center_x(temp_text,   font_large), 36), temp_text,   font=font_large, fill="white")
+            draw.text((cur_x, 36), current,    font=font_large, fill="white")
+            draw.text((arr_x, 40), "\u2192",   font=font_small, fill="white")
+            draw.text((set_x, 36), setpoint,   font=font_large, fill="white")
     except Exception as e:
         log.error(f"Display update error: {e}")
 
