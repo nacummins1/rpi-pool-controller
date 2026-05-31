@@ -27,7 +27,7 @@ import logging
 import glob
 import os
 
-import RPi.GPIO as GPIO
+from gpiozero import OutputDevice, Button, RotaryEncoder
 import paho.mqtt.client as mqtt
 from luma.core.interface.serial import i2c
 from luma.oled.device import sh1106
@@ -79,14 +79,11 @@ STATE_FILE = "/home/pi/pool_state.json"
 # GPIO 4 reserved — DS18B20 1-Wire (kernel managed via dtoverlay=w1-gpio)
 
 PIN_HEATER_RELAY    = 17
-
 PIN_ENCODER_CLK     = 23
 PIN_ENCODER_DT      = 24
 PIN_ENCODER_SW      = 22   # Push button — heater toggle
-
 PIN_BTN_POOL        = 5
 PIN_BTN_SPA         = 6
-
 PIN_VALVE_OPEN      = 27   # Stage 3
 PIN_VALVE_CLOSE     = 13   # Stage 3
 
@@ -95,11 +92,11 @@ PIN_VALVE_CLOSE     = 13   # Stage 3
 # -------------------------------------------------------
 
 state = {
-    "heater_enabled":           False,       # Master heater on/off
-    "heater_relay_on":          False,       # Actual relay state
-    "water_temp":               None,        # Current temp reading
+    "heater_enabled":           False,
+    "heater_relay_on":          False,
+    "water_temp":               None,
     "setpoint":                 SETPOINT_DEFAULT,
-    "valve_position":           "pool",      # "pool" or "spa"
+    "valve_position":           "pool",
     "sensor_unavailable_since": None,
 }
 
@@ -156,7 +153,7 @@ def find_temp_sensor():
         return devices[0]
     return None
 
-SENSOR_PATH = None   # Set on startup
+SENSOR_PATH = None
 
 def read_temperature():
     """Read DS18B20 temperature in Fahrenheit. Returns None on failure."""
@@ -177,6 +174,45 @@ def read_temperature():
     return None
 
 # -------------------------------------------------------
+# GPIO Devices (gpiozero)
+# -------------------------------------------------------
+
+heater_relay = None
+valve_open   = None
+valve_close  = None
+encoder      = None
+encoder_btn  = None
+btn_pool     = None
+btn_spa      = None
+
+def setup_gpio():
+    """Initialize all GPIO devices using gpiozero."""
+    global heater_relay, valve_open, valve_close
+    global encoder, encoder_btn, btn_pool, btn_spa
+
+    # Outputs
+    heater_relay = OutputDevice(PIN_HEATER_RELAY, active_high=True, initial_value=False)
+    valve_open   = OutputDevice(PIN_VALVE_OPEN,   active_high=True, initial_value=False)
+    valve_close  = OutputDevice(PIN_VALVE_CLOSE,  active_high=True, initial_value=False)
+
+    # Rotary encoder
+    encoder = RotaryEncoder(PIN_ENCODER_CLK, PIN_ENCODER_DT, max_steps=0)
+    encoder.when_rotated_clockwise         = encoder_cw
+    encoder.when_rotated_counter_clockwise = encoder_ccw
+
+    # Encoder push button
+    encoder_btn = Button(PIN_ENCODER_SW, pull_up=True, bounce_time=0.3)
+    encoder_btn.when_pressed = encoder_sw_callback
+
+    # Pool/Spa buttons
+    btn_pool = Button(PIN_BTN_POOL, pull_up=True, bounce_time=0.3)
+    btn_spa  = Button(PIN_BTN_SPA,  pull_up=True, bounce_time=0.3)
+    btn_pool.when_pressed = btn_pool_pressed
+    btn_spa.when_pressed  = btn_spa_pressed
+
+    log.info("GPIO initialized")
+
+# -------------------------------------------------------
 # Relay Control
 # -------------------------------------------------------
 
@@ -184,28 +220,25 @@ def set_heater_relay(on: bool):
     """Set heater relay state. Always writes to GPIO to prevent sync issues.
     Caller is responsible for publish_state() and update_display()."""
     state["heater_relay_on"] = on
-    GPIO.output(PIN_HEATER_RELAY, GPIO.HIGH if on else GPIO.LOW)
+    if on:
+        heater_relay.on()
+    else:
+        heater_relay.off()
     log.info(f"Heater relay: {'ON' if on else 'OFF'}")
 
 def set_valve(position: str):
-    """
-    Set valve position.
-    Stage 3: drives relay when VALVE_ACTUATORS_CONNECTED = True.
-    """
+    """Set valve position. Stage 3: drives relay when VALVE_ACTUATORS_CONNECTED = True."""
     if position not in ("pool", "spa"):
         log.warning(f"Invalid valve position: {position}")
         return
-
     state["valve_position"] = position
     log.info(f"Valve position set to: {position}")
-
     if VALVE_ACTUATORS_CONNECTED:
         # Stage 3 — drive relay
         # TODO: implement actuator timing when hardware connected
         pass
     else:
         log.info("Valve actuators not connected — software state only")
-
     save_state()
     publish_state()
     update_display()
@@ -220,7 +253,6 @@ def control_loop():
         temp = read_temperature()
 
         if temp is None:
-            # Sensor unavailable
             if state["sensor_unavailable_since"] is None:
                 state["sensor_unavailable_since"] = time.time()
                 log.warning("Temp sensor unavailable — watchdog started")
@@ -228,31 +260,26 @@ def control_loop():
                  time.time() - state["sensor_unavailable_since"] > SENSOR_UNAVAILABLE_TIMEOUT:
                 log.error("Sensor unavailable > 3 min — forcing heater off")
                 set_heater_relay(False)
-                state["sensor_unavailable_since"] = -1  # Watchdog fired — don't repeat
-            # Publish full state including unavailable temp
+                state["sensor_unavailable_since"] = -1
             mqtt_client.publish("pool/sensor/water_temp", "unavailable", retain=True)
             publish_state()
             update_display()
 
         else:
-            # Sensor available — clear watchdog
             if state["sensor_unavailable_since"] is not None:
                 log.info("Temp sensor recovered")
                 state["sensor_unavailable_since"] = None
 
             state["water_temp"] = temp
 
-            # Hysteresis logic — set_heater_relay() handles publish and display
             if state["heater_enabled"]:
                 if temp < (state["setpoint"] - HYSTERESIS):
                     set_heater_relay(True)
                 elif temp > (state["setpoint"] + HYSTERESIS):
                     set_heater_relay(False)
-                # Between band: hold current relay state
             else:
                 set_heater_relay(False)
 
-            # Always publish temp and display update each loop tick
             publish_state()
             update_display()
 
@@ -266,7 +293,6 @@ def publish_state():
     """Publish current state to MQTT broker."""
     if not mqtt_connected:
         return
-
     msgs = {
         "pool/state/heater_enabled":  "ON"  if state["heater_enabled"]  else "OFF",
         "pool/state/heater_relay":    "ON"  if state["heater_relay_on"] else "OFF",
@@ -275,7 +301,6 @@ def publish_state():
     }
     if state["water_temp"] is not None:
         msgs["pool/sensor/water_temp"] = str(state["water_temp"])
-
     for topic, payload in msgs.items():
         mqtt_client.publish(topic, payload, retain=True)
 
@@ -287,9 +312,7 @@ def publish_discovery():
         "model":        "RPi Pool Controller",
         "manufacturer": "Custom Build",
     }
-
     entities = [
-        # Water temp sensor
         ("homeassistant/sensor/pool_water_temp/config", {
             "name":                "Pool Water Temp",
             "state_topic":         "pool/sensor/water_temp",
@@ -298,7 +321,6 @@ def publish_discovery():
             "unique_id":           "pool_water_temp_01",
             "device":              device,
         }),
-        # Setpoint number
         ("homeassistant/number/pool_setpoint/config", {
             "name":                "Pool Setpoint",
             "state_topic":         "pool/sensor/setpoint",
@@ -310,7 +332,6 @@ def publish_discovery():
             "unique_id":           "pool_setpoint_01",
             "device":              device,
         }),
-        # Heater enabled switch
         ("homeassistant/switch/pool_heater_enabled/config", {
             "name":          "Pool Heater",
             "state_topic":   "pool/state/heater_enabled",
@@ -320,7 +341,6 @@ def publish_discovery():
             "unique_id":     "pool_heater_enabled_01",
             "device":        device,
         }),
-        # Heater relay binary sensor (read-only — actual relay state)
         ("homeassistant/binary_sensor/pool_heater_relay/config", {
             "name":        "Pool Heating",
             "state_topic": "pool/state/heater_relay",
@@ -329,7 +349,6 @@ def publish_discovery():
             "unique_id":   "pool_heater_relay_01",
             "device":      device,
         }),
-        # Valve position select
         ("homeassistant/select/pool_valve_position/config", {
             "name":          "Pool Valve Position",
             "state_topic":   "pool/state/valve_position",
@@ -339,7 +358,6 @@ def publish_discovery():
             "device":        device,
         }),
     ]
-
     for topic, payload in entities:
         mqtt_client.publish(topic, json.dumps(payload), retain=True)
         log.info(f"Discovery published: {topic}")
@@ -400,7 +418,6 @@ def on_disconnect(client, userdata, flags, reason_code, properties):
 # OLED Display
 # -------------------------------------------------------
 
-# Load fonts — falls back to default if not available
 try:
     font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
     font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
@@ -427,122 +444,50 @@ def center_x(text, font, width=128):
         bbox = font.getbbox(text)
         text_width = bbox[2] - bbox[0]
     except AttributeError:
-        text_width = len(text) * 7   # Fallback estimate
+        text_width = len(text) * 7
     return max(0, (width - text_width) // 2)
 
 def update_display():
     """Refresh OLED with current state."""
     if display_device is None:
         return
-
-    # Mode line
-    mode_text = "Pool Mode" if state["valve_position"] == "pool" else "Spa Mode"
-
-    # Heater status line
-    heater_str  = "ON" if state["heater_enabled"]  else "OFF"
+    mode_text   = "Pool Mode" if state["valve_position"] == "pool" else "Spa Mode"
+    heater_str  = "ON"  if state["heater_enabled"]  else "OFF"
     heating_str = "YES" if state["heater_relay_on"] else "NO"
     status_text = f"Heater:{heater_str}  Heat:{heating_str}"
-
-    # Temp line
-    current  = f"{state['water_temp']:.1f}°F" if state["water_temp"] is not None else "---°F"
-    setpoint = f"{state['setpoint']:.1f}°F"
-    temp_text = f"{current} → {setpoint}"
-
+    current     = f"{state['water_temp']:.1f}\u00b0F" if state["water_temp"] is not None else "---\u00b0F"
+    setpoint    = f"{state['setpoint']:.1f}\u00b0F"
+    temp_text   = f"{current} \u2192 {setpoint}"
     try:
         with canvas(display_device) as draw:
-            # Line 1 — Mode (small, centered)
-            draw.text(
-                (center_x(mode_text, font_small), 0),
-                mode_text,
-                font=font_small,
-                fill="white"
-            )
-            # Line 2 — Heater status (small, centered)
-            draw.text(
-                (center_x(status_text, font_small), 14),
-                status_text,
-                font=font_small,
-                fill="white"
-            )
-            # Lines 3/4 — Temps (large, centered)
-            draw.text(
-                (center_x(temp_text, font_large), 36),
-                temp_text,
-                font=font_large,
-                fill="white"
-            )
+            draw.text((center_x(mode_text,   font_small), 0),  mode_text,   font=font_small, fill="white")
+            draw.text((center_x(status_text, font_small), 14), status_text, font=font_small, fill="white")
+            draw.text((center_x(temp_text,   font_large), 36), temp_text,   font=font_large, fill="white")
     except Exception as e:
         log.error(f"Display update error: {e}")
-
-# -------------------------------------------------------
-# GPIO Setup
-# -------------------------------------------------------
-
-def setup_gpio():
-    """Initialize all GPIO pins."""
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-
-    # Outputs
-    GPIO.setup(PIN_HEATER_RELAY, GPIO.OUT, initial=GPIO.LOW)
-    GPIO.setup(PIN_VALVE_OPEN,   GPIO.OUT, initial=GPIO.LOW)   # Stage 3
-    GPIO.setup(PIN_VALVE_CLOSE,  GPIO.OUT, initial=GPIO.LOW)   # Stage 3
-
-    # Inputs — rotary encoder
-    GPIO.setup(PIN_ENCODER_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(PIN_ENCODER_DT,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(PIN_ENCODER_SW,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-    # Inputs — pool/spa buttons
-    GPIO.setup(PIN_BTN_POOL, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(PIN_BTN_SPA,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-    # Interrupts — rotary encoder
-    GPIO.add_event_detect(
-        PIN_ENCODER_CLK, GPIO.FALLING,
-        callback=encoder_callback,
-        bouncetime=50
-    )
-    GPIO.add_event_detect(
-        PIN_ENCODER_SW, GPIO.FALLING,
-        callback=encoder_sw_callback,
-        bouncetime=300
-    )
-
-    # Interrupts — pool/spa buttons
-    GPIO.add_event_detect(
-        PIN_BTN_POOL, GPIO.FALLING,
-        callback=btn_pool_pressed,
-        bouncetime=300
-    )
-    GPIO.add_event_detect(
-        PIN_BTN_SPA, GPIO.FALLING,
-        callback=btn_spa_pressed,
-        bouncetime=300
-    )
-
-    log.info("GPIO initialized")
 
 # -------------------------------------------------------
 # Rotary Encoder Callbacks
 # -------------------------------------------------------
 
-def encoder_callback(channel):
-    """Handle rotary encoder rotation — adjust setpoint."""
-    dt_state = GPIO.input(PIN_ENCODER_DT)
-    if dt_state == GPIO.HIGH:
-        # Clockwise — increase setpoint
-        state["setpoint"] = min(SETPOINT_MAX, state["setpoint"] + 1)
-    else:
-        # Counterclockwise — decrease setpoint
-        state["setpoint"] = max(SETPOINT_MIN, state["setpoint"] - 1)
+def encoder_cw():
+    """Clockwise rotation — increase setpoint."""
+    state["setpoint"] = min(SETPOINT_MAX, state["setpoint"] + 1)
     log.info(f"Setpoint adjusted to {state['setpoint']}°F")
     save_state()
     publish_state()
     update_display()
 
-def encoder_sw_callback(channel):
-    """Handle rotary encoder push — toggle heater enabled."""
+def encoder_ccw():
+    """Counter-clockwise rotation — decrease setpoint."""
+    state["setpoint"] = max(SETPOINT_MIN, state["setpoint"] - 1)
+    log.info(f"Setpoint adjusted to {state['setpoint']}°F")
+    save_state()
+    publish_state()
+    update_display()
+
+def encoder_sw_callback():
+    """Encoder push button — toggle heater enabled."""
     state["heater_enabled"] = not state["heater_enabled"]
     if not state["heater_enabled"]:
         set_heater_relay(False)
@@ -555,12 +500,12 @@ def encoder_sw_callback(channel):
 # Pool / Spa Button Callbacks
 # -------------------------------------------------------
 
-def btn_pool_pressed(channel):
+def btn_pool_pressed():
     """Set valve position to Pool Mode."""
     log.info("Pool button pressed")
     set_valve("pool")
 
-def btn_spa_pressed(channel):
+def btn_spa_pressed():
     """Set valve position to Spa Mode."""
     log.info("Spa button pressed")
     set_valve("spa")
@@ -594,14 +539,12 @@ def main():
     except Exception as e:
         log.warning(f"Initial MQTT connect failed: {e} — will retry in background")
 
-    mqtt_client.loop_start()   # MQTT runs in background thread
+    mqtt_client.loop_start()
 
-    # Control loop in background thread
     threading.Thread(target=control_loop, daemon=True).start()
 
     log.info("Pool Controller running")
 
-    # Keep main thread alive
     try:
         while True:
             time.sleep(1)
@@ -609,7 +552,9 @@ def main():
         log.info("Shutting down...")
         set_heater_relay(False)
         mqtt_client.loop_stop()
-        GPIO.cleanup()
+        heater_relay.close()
+        valve_open.close()
+        valve_close.close()
         log.info("Shutdown complete")
 
 if __name__ == "__main__":
