@@ -242,12 +242,12 @@ def _monitor_encoder():
                 now = time.monotonic()
 
                 if event.line_offset == PIN_ENCODER_CLK:
-                    # CLK fell — if DT fell recently before CLK, it's CCW
-                    # if DT hasn't fallen yet, it's CW
+                    # CLK fell — if DT fell recently before CLK, it's CW
+                    # if DT hasn't fallen yet, it's CCW
                     if (now - last_dt_time) < 0.05:
-                        encoder_ccw()
-                    else:
                         encoder_cw()
+                    else:
+                        encoder_ccw()
                     last_clk_time = now
 
                 elif event.line_offset == PIN_ENCODER_DT:
