@@ -67,6 +67,7 @@ CONTROL_LOOP_INTERVAL      = 10
 HYSTERESIS                 = 2.0
 
 VALVE_ACTUATORS_CONNECTED = False
+VALVE_TRAVEL_TIME = 45  # seconds — adjust after testing with actual GV-24 actuator
 STATE_FILE = "/home/pi/pool_state.json"
 GPIO_CHIP  = "/dev/gpiochip0"
 
@@ -105,6 +106,10 @@ state = {
 
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 mqtt_connected = False
+
+# Valve movement lock — prevents simultaneous actuator activation
+_valve_moving = False
+_valve_lock   = threading.Lock()
 
 # -------------------------------------------------------
 # Persistent State
@@ -301,18 +306,78 @@ def set_heater_relay(on: bool):
     log.info(f"Heater relay: {'ON' if on else 'OFF'}")
 
 def set_valve(position: str):
+    """Set valve position.
+    Stage 3: drives relay with movement lock when VALVE_ACTUATORS_CONNECTED = True.
+    Always safe — never allows both relays on simultaneously.
+    Ignores requests while actuator is already moving.
+    """
+    global _valve_moving
+
     if position not in ("pool", "spa"):
         log.warning(f"Invalid valve position: {position}")
         return
-    state["valve_position"] = position
-    log.info(f"Valve position set to: {position}")
-    if VALVE_ACTUATORS_CONNECTED:
-        pass  # Stage 3 — TODO
-    else:
+
+    if not VALVE_ACTUATORS_CONNECTED:
+        # Software state only — no hardware movement
+        state["valve_position"] = position
+        log.info(f"Valve position set to: {position}")
         log.info("Valve actuators not connected — software state only")
-    save_state()
-    publish_state()
-    update_display()
+        save_state()
+        publish_state()
+        update_display()
+        return
+
+    # Already moving — ignore request
+    if _valve_moving:
+        log.warning(f"Valve move to {position} ignored — actuator already moving")
+        return
+
+    # Already in requested position — no movement needed
+    if position == state["valve_position"]:
+        log.info(f"Valve already in {position} position — no movement needed")
+        return
+
+    def _do_move():
+        global _valve_moving
+        with _valve_lock:
+            _valve_moving = True
+            log.info(f"Valve moving to: {position}")
+
+            # Publish transitioning state
+            if mqtt_connected:
+                mqtt_client.publish("pool/state/valve_position", "transitioning", retain=True)
+            update_display()
+
+            try:
+                # Safety: ensure both relays off before starting
+                _set_output(PIN_VALVE_OPEN,  False)
+                _set_output(PIN_VALVE_CLOSE, False)
+                time.sleep(0.1)  # 100ms gap
+
+                # Fire correct relay
+                if position == "pool":
+                    _set_output(PIN_VALVE_OPEN, True)
+                else:
+                    _set_output(PIN_VALVE_CLOSE, True)
+
+                # Hold for full travel time
+                time.sleep(VALVE_TRAVEL_TIME)
+
+            finally:
+                # Always turn both relays off — even if exception occurs
+                _set_output(PIN_VALVE_OPEN,  False)
+                _set_output(PIN_VALVE_CLOSE, False)
+                _valve_moving = False
+
+            # Update state after successful move
+            state["valve_position"] = position
+            log.info(f"Valve move complete: {position}")
+            save_state()
+            publish_state()
+            update_display()
+
+    # Run valve movement in background thread — doesn't block buttons or control loop
+    threading.Thread(target=_do_move, daemon=True).start()
 
 # -------------------------------------------------------
 # Control Loop
@@ -399,7 +464,7 @@ def publish_discovery():
         }),
         ("homeassistant/select/pool_valve_position/config", {
             "name": "Pool Valve Position", "state_topic": "pool/state/valve_position",
-            "command_topic": "pool/cmd/valve", "options": ["pool", "spa"],
+            "command_topic": "pool/cmd/valve", "options": ["pool", "spa", "transitioning"],
             "unique_id": "pool_valve_position_01", "device": device,
         }),
     ]
@@ -491,7 +556,12 @@ def center_x(text, font, width=128):
 def update_display():
     if display_device is None:
         return
-    mode_text   = "Pool Mode" if state["valve_position"] == "pool" else "Spa Mode"
+    if _valve_moving:
+        mode_text = "Moving..."
+    elif state["valve_position"] == "pool":
+        mode_text = "Pool Mode"
+    else:
+        mode_text = "Spa Mode"
     heater_str  = "ON"  if state["heater_enabled"]  else "OFF"
     heating_str = "YES" if state["heater_relay_on"] else "NO"
     status_text = f"Heater:{heater_str}  Heat:{heating_str}"
