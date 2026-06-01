@@ -96,6 +96,7 @@ state = {
     "setpoint":                 SETPOINT_DEFAULT,
     "valve_position":           "pool",
     "sensor_unavailable_since": None,
+    "pump_should_run":          False,   # From Node-RED schedule
 }
 
 # -------------------------------------------------------
@@ -435,6 +436,9 @@ def on_message(client, userdata, msg):
             set_valve(payload)
         else:
             log.warning(f"Invalid valve command: {payload}")
+    elif topic == "pool/schedule/pump_should_run":
+        state["pump_should_run"] = (payload.lower() == "on")
+        log.info(f"Pump should run: {state['pump_should_run']}")
 
 def on_connect(client, userdata, flags, reason_code, properties):
     global mqtt_connected
@@ -442,6 +446,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
         mqtt_connected = True
         log.info(f"Connected to MQTT broker at {BROKER_IP}:{BROKER_PORT}")
         client.subscribe("pool/cmd/#")
+        client.subscribe("pool/schedule/pump_should_run")
         publish_discovery()
         publish_state()
     else:
@@ -546,10 +551,12 @@ def btn_pool_pressed():
     state["setpoint"] = 80.0
     set_heater_relay(False)
     set_valve("pool")
-    # Turn off pump via HA
-    if mqtt_connected:
+    # Only turn off pump if schedule says it shouldn't be running
+    if mqtt_connected and not state["pump_should_run"]:
         mqtt_client.publish("pool/cmd/pump", "OFF", retain=False)
-        log.info("Pool mode: heater off, setpoint 80, pump off command sent")
+        log.info("Pool mode: past pump schedule — pump off command sent")
+    else:
+        log.info("Pool mode: within pump schedule — pump left running")
     save_state()
     publish_state()
     update_display()
