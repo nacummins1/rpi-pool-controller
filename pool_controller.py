@@ -542,11 +542,30 @@ def encoder_sw_callback():
 
 def btn_pool_pressed():
     log.info("Pool button pressed")
+    state["heater_enabled"] = False
+    state["setpoint"] = 80.0
+    set_heater_relay(False)
     set_valve("pool")
+    # Turn off pump via HA
+    if mqtt_connected:
+        mqtt_client.publish("pool/cmd/pump", "OFF", retain=False)
+        log.info("Pool mode: heater off, setpoint 80, pump off command sent")
+    save_state()
+    publish_state()
+    update_display()
 
 def btn_spa_pressed():
     log.info("Spa button pressed")
+    state["heater_enabled"] = True
+    state["setpoint"] = 100.0
     set_valve("spa")
+    # Turn on pump via HA
+    if mqtt_connected:
+        mqtt_client.publish("pool/cmd/pump", "ON", retain=False)
+        log.info("Spa mode: heater on, setpoint 100, pump on command sent")
+    save_state()
+    publish_state()
+    update_display()
 
 # -------------------------------------------------------
 # Main
