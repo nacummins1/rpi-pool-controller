@@ -620,29 +620,23 @@ def btn_pool_pressed():
     state["heater_enabled"] = False
     state["setpoint"] = 80.0
     set_heater_relay(False)
-    set_valve("pool")
     # Only turn off pump if schedule says it shouldn't be running
     if mqtt_connected and not state["pump_should_run"]:
         mqtt_client.publish("pool/cmd/pump", "OFF", retain=False)
         log.info("Pool mode: past pump schedule — pump off command sent")
     else:
         log.info("Pool mode: within pump schedule — pump left running")
-    save_state()
-    publish_state()
-    update_display()
+    set_valve("pool")  # handles save/publish/display internally
 
 def btn_spa_pressed():
     log.info("Spa button pressed")
     state["heater_enabled"] = True
     state["setpoint"] = 100.0
-    set_valve("spa")
     # Turn on pump via HA
     if mqtt_connected:
         mqtt_client.publish("pool/cmd/pump", "ON", retain=False)
         log.info("Spa mode: heater on, setpoint 100, pump on command sent")
-    save_state()
-    publish_state()
-    update_display()
+    set_valve("spa")  # handles save/publish/display internally
 
 # -------------------------------------------------------
 # Main
