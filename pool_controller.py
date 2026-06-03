@@ -230,7 +230,7 @@ def _monitor_encoder():
             PIN_ENCODER_CLK: gpiod.LineSettings(
                 edge_detection=Edge.FALLING,
                 bias=Bias.PULL_UP,
-                debounce_period=datetime.timedelta(milliseconds=5)
+                debounce_period=datetime.timedelta(milliseconds=8)
             ),
             PIN_ENCODER_DT: gpiod.LineSettings(
                 direction=Direction.INPUT,
