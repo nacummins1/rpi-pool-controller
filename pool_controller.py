@@ -98,6 +98,7 @@ state = {
     "valve_position":           "pool",
     "sensor_unavailable_since": None,
     "pump_should_run":          False,   # From Node-RED schedule
+    "standby":                  False,   # Standby mode — disables physical controls
 }
 
 # -------------------------------------------------------
@@ -120,6 +121,7 @@ def save_state():
         "setpoint":       state["setpoint"],
         "heater_enabled": state["heater_enabled"],
         "valve_position": state["valve_position"],
+        "standby":        state["standby"],
     }
     try:
         with open(STATE_FILE, "w") as f:
@@ -137,7 +139,8 @@ def load_state():
         state["setpoint"]       = float(data.get("setpoint", SETPOINT_DEFAULT))
         state["heater_enabled"] = bool(data.get("heater_enabled", False))
         state["valve_position"] = data.get("valve_position", "pool")
-        log.info(f"State restored: setpoint={state['setpoint']}, heater={state['heater_enabled']}, valve={state['valve_position']}")
+        state["standby"]        = bool(data.get("standby", False))
+        log.info(f"State restored: setpoint={state['setpoint']}, heater={state['heater_enabled']}, valve={state['valve_position']}, standby={state['standby']}")
     except Exception as e:
         log.warning(f"Failed to load state: {e}")
 
@@ -249,23 +252,32 @@ def _monitor_encoder():
                         encoder_ccw()
 
 def _monitor_encoder_sw():
-    """Monitor encoder push button separately."""
+    """Monitor encoder push button — short press toggles heater, long press (3s) toggles standby."""
     with gpiod.request_lines(
         GPIO_CHIP,
         consumer="pool-encoder-sw",
         config={
             PIN_ENCODER_SW: gpiod.LineSettings(
-                edge_detection=Edge.FALLING,
+                edge_detection=Edge.BOTH,
                 bias=Bias.PULL_UP,
-                debounce_period=datetime.timedelta(milliseconds=300)
+                debounce_period=datetime.timedelta(milliseconds=50)
             ),
         }
     ) as sw_lines:
         log.info("Encoder button monitoring started")
+        press_time = None
         while True:
             for event in sw_lines.read_edge_events():
-                log.info("Encoder button pressed")
-                encoder_sw_callback()
+                if event.event_type == gpiod.EdgeEvent.Type.FALLING_EDGE:
+                    press_time = time.monotonic()
+                elif event.event_type == gpiod.EdgeEvent.Type.RISING_EDGE:
+                    if press_time is not None:
+                        held = time.monotonic() - press_time
+                        press_time = None
+                        if held >= 3.0:
+                            toggle_standby()
+                        else:
+                            encoder_sw_callback()
 
 def _monitor_buttons():
     """Monitor Pool and Spa buttons using edge detection."""
@@ -424,6 +436,7 @@ def publish_state():
         "pool/state/heater_relay":    "ON"  if state["heater_relay_on"] else "OFF",
         "pool/sensor/setpoint":       str(state["setpoint"]),
         "pool/state/valve_position":  state["valve_position"],
+        "pool/state/standby":         "ON"  if state["standby"]         else "OFF",
     }
     if state["water_temp"] is not None:
         msgs["pool/sensor/water_temp"] = str(state["water_temp"])
@@ -464,6 +477,14 @@ def publish_discovery():
             "name": "Pool Valve Position", "state_topic": "pool/state/valve_position",
             "command_topic": "pool/cmd/valve", "options": ["pool", "spa", "transitioning"],
             "unique_id": "pool_valve_position_01", "device": device,
+        }),
+        ("homeassistant/binary_sensor/pool_standby/config", {
+            "name": "Pool Standby",
+            "state_topic": "pool/state/standby",
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "unique_id": "pool_standby_01",
+            "device": device,
         }),
     ]
     for topic, payload in entities:
@@ -554,7 +575,9 @@ def center_x(text, font, width=128):
 def update_display():
     if display_device is None:
         return
-    if _valve_moving:
+    if state["standby"]:
+        mode_text = "** STANDBY **"
+    elif _valve_moving:
         mode_text = "Moving..."
     elif state["valve_position"] == "pool":
         mode_text = "Pool Mode"
@@ -591,6 +614,8 @@ def update_display():
 # -------------------------------------------------------
 
 def encoder_cw():
+    if state["standby"]:
+        return
     state["setpoint"] = min(SETPOINT_MAX, state["setpoint"] + 1)
     log.info(f"Setpoint adjusted to {state['setpoint']}°F")
     save_state()
@@ -598,6 +623,8 @@ def encoder_cw():
     update_display()
 
 def encoder_ccw():
+    if state["standby"]:
+        return
     state["setpoint"] = max(SETPOINT_MIN, state["setpoint"] - 1)
     log.info(f"Setpoint adjusted to {state['setpoint']}°F")
     save_state()
@@ -605,6 +632,8 @@ def encoder_ccw():
     update_display()
 
 def encoder_sw_callback():
+    if state["standby"]:
+        return
     state["heater_enabled"] = not state["heater_enabled"]
     if not state["heater_enabled"]:
         set_heater_relay(False)
@@ -613,7 +642,22 @@ def encoder_sw_callback():
     publish_state()
     update_display()
 
+def toggle_standby():
+    state["standby"] = not state["standby"]
+    if state["standby"]:
+        # Entering standby — force heater off
+        state["heater_enabled"] = False
+        set_heater_relay(False)
+        log.info("Standby mode ON — heater disabled, physical controls locked")
+    else:
+        log.info("Standby mode OFF — normal operation resumed")
+    save_state()
+    publish_state()
+    update_display()
+
 def btn_pool_pressed():
+    if state["standby"]:
+        return
     log.info("Pool button pressed")
     state["heater_enabled"] = False
     state["setpoint"] = 80.0
@@ -627,6 +671,8 @@ def btn_pool_pressed():
     set_valve("pool")  # handles save/publish/display internally
 
 def btn_spa_pressed():
+    if state["standby"]:
+        return
     log.info("Spa button pressed")
     state["heater_enabled"] = True
     state["setpoint"] = 100.0
