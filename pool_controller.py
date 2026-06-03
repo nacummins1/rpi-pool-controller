@@ -99,7 +99,8 @@ state = {
     "setpoint":                 SETPOINT_DEFAULT,
     "valve_position":           "pool",
     "sensor_unavailable_since": None,
-    "pump_should_run":          False,   # From Node-RED schedule
+    "pump_should_run":          False,   # From Node-RED schedule (bigtimer)
+    "pump_is_on":               False,   # Actual pump state from HA
     "standby":                  False,   # Standby mode — disables physical controls
 }
 
@@ -531,8 +532,13 @@ def on_message(client, userdata, msg):
         else:
             log.warning(f"Invalid valve command: {payload}")
     elif topic == "pool/schedule/pump_should_run":
+        # Legacy topic — actual pump state from HA
+        state["pump_is_on"] = (payload.lower() == "on")
+        log.info(f"Pump is on: {state['pump_is_on']}")
+    elif topic == "pool/schedule/pump_in_schedule":
+        # Schedule state from bigtimer — true only during scheduled hours
         state["pump_should_run"] = (payload.lower() == "on")
-        log.info(f"Pump should run: {state['pump_should_run']}")
+        log.info(f"Pump in schedule: {state['pump_should_run']}")
 
 def on_connect(client, userdata, flags, reason_code, properties):
     global mqtt_connected
@@ -541,6 +547,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
         log.info(f"Connected to MQTT broker at {BROKER_IP}:{BROKER_PORT}")
         client.subscribe("pool/cmd/#")
         client.subscribe("pool/schedule/pump_should_run")
+        client.subscribe("pool/schedule/pump_in_schedule")
         publish_discovery()
         publish_state()
     else:
