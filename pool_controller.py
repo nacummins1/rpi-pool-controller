@@ -83,8 +83,10 @@ PIN_ENCODER_DT   = 24
 PIN_ENCODER_SW   = 22
 PIN_BTN_POOL     = 5
 PIN_BTN_SPA      = 6
-PIN_VALVE_OPEN   = 27   # Stage 3
-PIN_VALVE_CLOSE  = 13   # Stage 3
+PIN_VALVE_OPEN    = 27   # Stage 3 — Actuator A open
+PIN_VALVE_CLOSE   = 13   # Stage 3 — Actuator A close
+PIN_VALVE_B_OPEN  = 19   # Stage 3 — Actuator B open
+PIN_VALVE_B_CLOSE = 26   # Stage 3 — Actuator B close
 
 # -------------------------------------------------------
 # State
@@ -202,6 +204,14 @@ def setup_gpio():
                 output_value=Value.INACTIVE
             ),
             PIN_VALVE_CLOSE: gpiod.LineSettings(
+                direction=Direction.OUTPUT,
+                output_value=Value.INACTIVE
+            ),
+            PIN_VALVE_B_OPEN: gpiod.LineSettings(
+                direction=Direction.OUTPUT,
+                output_value=Value.INACTIVE
+            ),
+            PIN_VALVE_B_CLOSE: gpiod.LineSettings(
                 direction=Direction.OUTPUT,
                 output_value=Value.INACTIVE
             ),
