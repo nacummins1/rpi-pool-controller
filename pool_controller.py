@@ -218,7 +218,11 @@ def _set_output(pin: int, value: bool):
     _output_lines.set_value(pin, Value.ACTIVE if value else Value.INACTIVE)
 
 def _monitor_encoder():
-    """Monitor rotary encoder CLK/DT using edge detection."""
+    """Monitor KY-040 rotary encoder CLK/DT using edge detection.
+    KY-040 has onboard pull-up resistors — clean signals, simple direction detection.
+    On CLK falling edge, DT level determines direction:
+      DT HIGH = clockwise, DT LOW = counter-clockwise.
+    """
     with gpiod.request_lines(
         GPIO_CHIP,
         consumer="pool-encoder",
@@ -226,29 +230,23 @@ def _monitor_encoder():
             PIN_ENCODER_CLK: gpiod.LineSettings(
                 edge_detection=Edge.FALLING,
                 bias=Bias.PULL_UP,
-                debounce_period=datetime.timedelta(milliseconds=3)
+                debounce_period=datetime.timedelta(milliseconds=5)
             ),
             PIN_ENCODER_DT: gpiod.LineSettings(
-                edge_detection=Edge.FALLING,
+                direction=Direction.INPUT,
                 bias=Bias.PULL_UP,
-                debounce_period=datetime.timedelta(milliseconds=3)
             ),
         }
     ) as enc_lines:
         log.info("Encoder monitoring started")
-        last_clk_time = 0
-        last_dt_time  = 0
         while True:
             for event in enc_lines.read_edge_events():
-                now = time.monotonic()
                 if event.line_offset == PIN_ENCODER_CLK:
-                    if (now - last_dt_time) < 0.05:
+                    dt = enc_lines.get_value(PIN_ENCODER_DT) == Value.ACTIVE
+                    if dt:
                         encoder_cw()
                     else:
                         encoder_ccw()
-                    last_clk_time = now
-                elif event.line_offset == PIN_ENCODER_DT:
-                    last_dt_time = now
 
 def _monitor_encoder_sw():
     """Monitor encoder push button separately."""
