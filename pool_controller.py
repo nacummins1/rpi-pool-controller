@@ -242,7 +242,6 @@ def _monitor_encoder():
         while True:
             for event in enc_lines.read_edge_events():
                 if event.line_offset == PIN_ENCODER_CLK:
-                    time.sleep(0.002)  # 2ms settle time for DT
                     dt = enc_lines.get_value(PIN_ENCODER_DT) == Value.ACTIVE
                     if dt:
                         encoder_cw()
