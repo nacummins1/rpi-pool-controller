@@ -14,7 +14,9 @@ Hardware:
   - Pool button             GPIO 5
   - Spa button              GPIO 6
   - Valve relay A (open)    GPIO 27  (Stage 3)
-  - Valve relay B (close)   GPIO 13  (Stage 3)
+  - Valve relay A (close)   GPIO 13  (Stage 3)
+  - Valve relay B (open)    GPIO 7   (Stage 3)
+  - Valve relay B (close)   GPIO 8   (Stage 3)
   - OLED display            GPIO 2 (SDA), GPIO 3 (SCL) - I2C, kernel managed
 
 MQTT Broker: 192.168.1.13:1883
@@ -77,16 +79,16 @@ GPIO_CHIP  = "/dev/gpiochip0"
 
 # GPIO 4 reserved — DS18B20 1-Wire (kernel managed via dtoverlay=w1-gpio)
 
-PIN_HEATER_RELAY = 17
-PIN_ENCODER_CLK  = 23
-PIN_ENCODER_DT   = 24
-PIN_ENCODER_SW   = 22
-PIN_BTN_POOL     = 5
-PIN_BTN_SPA      = 6
+PIN_HEATER_RELAY  = 17
+PIN_ENCODER_CLK   = 23
+PIN_ENCODER_DT    = 24
+PIN_ENCODER_SW    = 22
+PIN_BTN_POOL      = 5
+PIN_BTN_SPA       = 6
 PIN_VALVE_OPEN    = 27   # Stage 3 — Actuator A open
 PIN_VALVE_CLOSE   = 13   # Stage 3 — Actuator A close
-PIN_VALVE_B_OPEN  = 19   # Stage 3 — Actuator B open
-PIN_VALVE_B_CLOSE = 26   # Stage 3 — Actuator B close
+PIN_VALVE_B_OPEN  = 7    # Stage 3 — Actuator B open
+PIN_VALVE_B_CLOSE = 8    # Stage 3 — Actuator B close
 
 # -------------------------------------------------------
 # State
@@ -183,7 +185,6 @@ def read_temperature():
 # GPIO — libgpiod v2
 # -------------------------------------------------------
 
-# Output line requests
 _output_lines = None
 _chip = None
 
@@ -193,7 +194,6 @@ def setup_gpio():
 
     _chip = gpiod.Chip(GPIO_CHIP)
 
-    # Configure output pins (relay lines)
     _output_lines = _chip.request_lines(
         config={
             PIN_HEATER_RELAY: gpiod.LineSettings(
@@ -220,23 +220,17 @@ def setup_gpio():
         consumer="pool-outputs"
     )
 
-    # Start input monitoring threads for buttons and encoder
-    threading.Thread(target=_monitor_encoder, daemon=True).start()
+    threading.Thread(target=_monitor_encoder,    daemon=True).start()
     threading.Thread(target=_monitor_encoder_sw, daemon=True).start()
-    threading.Thread(target=_monitor_buttons, daemon=True).start()
+    threading.Thread(target=_monitor_buttons,    daemon=True).start()
 
     log.info("GPIO initialized")
 
 def _set_output(pin: int, value: bool):
-    """Set an output pin high or low."""
     _output_lines.set_value(pin, Value.ACTIVE if value else Value.INACTIVE)
 
 def _monitor_encoder():
-    """Monitor KY-040 rotary encoder CLK/DT using edge detection.
-    KY-040 has onboard pull-up resistors — clean signals, simple direction detection.
-    On CLK falling edge, DT level determines direction:
-      DT HIGH = clockwise, DT LOW = counter-clockwise.
-    """
+    """Monitor KY-040 rotary encoder CLK/DT using edge detection."""
     with gpiod.request_lines(
         GPIO_CHIP,
         consumer="pool-encoder",
@@ -339,7 +333,6 @@ def set_valve(position: str):
         return
 
     if not VALVE_ACTUATORS_CONNECTED:
-        # Software state only — no hardware movement
         state["valve_position"] = position
         log.info(f"Valve position set to: {position}")
         log.info("Valve actuators not connected — software state only")
@@ -348,12 +341,10 @@ def set_valve(position: str):
         update_display()
         return
 
-    # Already moving — ignore request
     if _valve_moving:
         log.warning(f"Valve move to {position} ignored — actuator already moving")
         return
 
-    # Already in requested position — no movement needed
     if position == state["valve_position"]:
         log.info(f"Valve already in {position} position — no movement needed")
         return
@@ -363,41 +354,34 @@ def set_valve(position: str):
         with _valve_lock:
             _valve_moving = True
             log.info(f"Valve moving to: {position}")
-
-            # Publish transitioning state
             if mqtt_connected:
                 mqtt_client.publish("pool/state/valve_position", "transitioning", retain=True)
             update_display()
-
             try:
-                # Safety: ensure both relays off before starting
-                _set_output(PIN_VALVE_OPEN,  False)
-                _set_output(PIN_VALVE_CLOSE, False)
-                time.sleep(0.1)  # 100ms gap
-
-                # Fire correct relay
+                _set_output(PIN_VALVE_OPEN,    False)
+                _set_output(PIN_VALVE_CLOSE,   False)
+                _set_output(PIN_VALVE_B_OPEN,  False)
+                _set_output(PIN_VALVE_B_CLOSE, False)
+                time.sleep(0.1)
                 if position == "pool":
-                    _set_output(PIN_VALVE_OPEN, True)
+                    _set_output(PIN_VALVE_OPEN,   True)
+                    _set_output(PIN_VALVE_B_OPEN, True)
                 else:
-                    _set_output(PIN_VALVE_CLOSE, True)
-
-                # Hold for full travel time
+                    _set_output(PIN_VALVE_CLOSE,   True)
+                    _set_output(PIN_VALVE_B_CLOSE, True)
                 time.sleep(VALVE_TRAVEL_TIME)
-
             finally:
-                # Always turn both relays off — even if exception occurs
-                _set_output(PIN_VALVE_OPEN,  False)
-                _set_output(PIN_VALVE_CLOSE, False)
+                _set_output(PIN_VALVE_OPEN,    False)
+                _set_output(PIN_VALVE_CLOSE,   False)
+                _set_output(PIN_VALVE_B_OPEN,  False)
+                _set_output(PIN_VALVE_B_CLOSE, False)
                 _valve_moving = False
-
-            # Update state after successful move
             state["valve_position"] = position
             log.info(f"Valve move complete: {position}")
             save_state()
             publish_state()
             update_display()
 
-    # Run valve movement in background thread — doesn't block buttons or control loop
     threading.Thread(target=_do_move, daemon=True).start()
 
 # -------------------------------------------------------
@@ -490,12 +474,9 @@ def publish_discovery():
             "unique_id": "pool_valve_position_01", "device": device,
         }),
         ("homeassistant/binary_sensor/pool_standby/config", {
-            "name": "Pool Standby",
-            "state_topic": "pool/state/standby",
-            "payload_on": "ON",
-            "payload_off": "OFF",
-            "unique_id": "pool_standby_01",
-            "device": device,
+            "name": "Pool Standby", "state_topic": "pool/state/standby",
+            "payload_on": "ON", "payload_off": "OFF",
+            "unique_id": "pool_standby_01", "device": device,
         }),
     ]
     for topic, payload in entities:
@@ -532,11 +513,9 @@ def on_message(client, userdata, msg):
         else:
             log.warning(f"Invalid valve command: {payload}")
     elif topic == "pool/schedule/pump_should_run":
-        # Legacy topic — actual pump state from HA
         state["pump_is_on"] = (payload.lower() == "on")
         log.info(f"Pump is on: {state['pump_is_on']}")
     elif topic == "pool/schedule/pump_in_schedule":
-        # Schedule state from bigtimer — true only during scheduled hours
         state["pump_should_run"] = (payload.lower() == "on")
         log.info(f"Pump in schedule: {state['pump_should_run']}")
 
@@ -605,24 +584,21 @@ def update_display():
     status_text = f"Heater:{heater_str}  Heat:{heating_str}"
     current  = f"{state['water_temp']:.0f}\u00b0" if state["water_temp"] is not None else "---\u00b0"
     setpoint = f"{state['setpoint']:.0f}\u00b0"
-
-    # Calculate positions for split temp line
-    cur_w  = font_large.getbbox(current)[2]
-    set_w  = font_large.getbbox(setpoint)[2]
-    arr_w  = font_small.getbbox("\u2192")[2]
-    total_w = cur_w + arr_w + set_w + 6  # 3px padding each side of arrow
+    cur_w   = font_large.getbbox(current)[2]
+    set_w   = font_large.getbbox(setpoint)[2]
+    arr_w   = font_small.getbbox("\u2192")[2]
+    total_w = cur_w + arr_w + set_w + 6
     start_x = max(0, (128 - total_w) // 2)
-    cur_x  = start_x
-    arr_x  = cur_x + cur_w + 3
-    set_x  = arr_x + arr_w + 3
-
+    cur_x   = start_x
+    arr_x   = cur_x + cur_w + 3
+    set_x   = arr_x + arr_w + 3
     try:
         with canvas(display_device) as draw:
             draw.text((center_x(mode_text,   font_small), 0),  mode_text,   font=font_small, fill="white")
             draw.text((center_x(status_text, font_small), 14), status_text, font=font_small, fill="white")
-            draw.text((cur_x, 36), current,    font=font_large, fill="white")
-            draw.text((arr_x, 40), "\u2192",   font=font_small, fill="white")
-            draw.text((set_x, 36), setpoint,   font=font_large, fill="white")
+            draw.text((cur_x, 36), current,  font=font_large, fill="white")
+            draw.text((arr_x, 40), "\u2192", font=font_small, fill="white")
+            draw.text((set_x, 36), setpoint, font=font_large, fill="white")
     except Exception as e:
         log.error(f"Display update error: {e}")
 
@@ -662,7 +638,6 @@ def encoder_sw_callback():
 def toggle_standby():
     state["standby"] = not state["standby"]
     if state["standby"]:
-        # Entering standby — force heater off
         state["heater_enabled"] = False
         set_heater_relay(False)
         log.info("Standby mode ON — heater disabled, physical controls locked")
@@ -679,13 +654,12 @@ def btn_pool_pressed():
     state["heater_enabled"] = False
     state["setpoint"] = 80.0
     set_heater_relay(False)
-    # Only turn off pump if schedule says it shouldn't be running
     if mqtt_connected and not state["pump_should_run"]:
         mqtt_client.publish("pool/cmd/pump", "OFF", retain=False)
         log.info("Pool mode: past pump schedule — pump off command sent")
     else:
         log.info("Pool mode: within pump schedule — pump left running")
-    set_valve("pool")  # handles save/publish/display internally
+    set_valve("pool")
 
 def btn_spa_pressed():
     if state["standby"]:
@@ -693,11 +667,10 @@ def btn_spa_pressed():
     log.info("Spa button pressed")
     state["heater_enabled"] = True
     state["setpoint"] = 100.0
-    # Turn on pump via HA
     if mqtt_connected:
         mqtt_client.publish("pool/cmd/pump", "ON", retain=False)
         log.info("Spa mode: heater on, setpoint 100, pump on command sent")
-    set_valve("spa")  # handles save/publish/display internally
+    set_valve("spa")
 
 # -------------------------------------------------------
 # Main
