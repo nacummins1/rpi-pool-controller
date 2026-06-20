@@ -68,6 +68,8 @@ SENSOR_UNAVAILABLE_TIMEOUT = 180
 CONTROL_LOOP_INTERVAL      = 10
 HYSTERESIS                 = 2.0
 
+CPU_TEMP_PATH = "/sys/class/thermal/thermal_zone0/temp"
+
 VALVE_ACTUATORS_CONNECTED = False
 VALVE_TRAVEL_TIME = 45  # seconds — adjust after testing with actual GV-24 actuator
 STATE_FILE = "/home/pi/pool_state.json"
@@ -104,6 +106,7 @@ state = {
     "pump_should_run":          False,   # From Node-RED schedule (bigtimer)
     "pump_is_on":               False,   # Actual pump state from HA
     "standby":                  False,   # Standby mode — disables physical controls
+    "cpu_temp":                 None,
 }
 
 # -------------------------------------------------------
@@ -180,6 +183,18 @@ def read_temperature():
     except Exception as e:
         log.warning(f"Temp sensor read error: {e}")
     return None
+
+def read_cpu_temp():
+    """Read RPi CPU/SoC temperature in Fahrenheit."""
+    try:
+        with open(CPU_TEMP_PATH, "r") as f:
+            millideg_c = int(f.read().strip())
+        temp_c = millideg_c / 1000.0
+        temp_f = (temp_c * 9 / 5) + 32
+        return round(temp_f, 1)
+    except Exception as e:
+        log.warning(f"CPU temp read error: {e}")
+        return None
 
 # -------------------------------------------------------
 # GPIO — libgpiod v2
@@ -390,6 +405,7 @@ def set_valve(position: str):
 
 def control_loop():
     while True:
+        state["cpu_temp"] = read_cpu_temp()
         temp = read_temperature()
         if temp is None:
             if state["sensor_unavailable_since"] is None:
@@ -435,6 +451,8 @@ def publish_state():
     }
     if state["water_temp"] is not None:
         msgs["pool/sensor/water_temp"] = str(state["water_temp"])
+    if state["cpu_temp"] is not None:
+        msgs["pool/sensor/cpu_temp"] = str(state["cpu_temp"])
     for topic, payload in msgs.items():
         mqtt_client.publish(topic, payload, retain=True)
 
@@ -450,6 +468,12 @@ def publish_discovery():
             "name": "Pool Water Temp", "state_topic": "pool/sensor/water_temp",
             "unit_of_measurement": "°F", "device_class": "temperature",
             "unique_id": "pool_water_temp_01", "device": device,
+        }),
+        ("homeassistant/sensor/pool_cpu_temp/config", {
+            "name": "Pool Controller CPU Temp", "state_topic": "pool/sensor/cpu_temp",
+            "unit_of_measurement": "°F", "device_class": "temperature",
+            "entity_category": "diagnostic",
+            "unique_id": "pool_cpu_temp_01", "device": device,
         }),
         ("homeassistant/number/pool_setpoint/config", {
             "name": "Pool Setpoint", "state_topic": "pool/sensor/setpoint",
