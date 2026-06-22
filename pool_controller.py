@@ -70,7 +70,7 @@ HYSTERESIS                 = 2.0
 
 CPU_TEMP_PATH = "/sys/class/thermal/thermal_zone0/temp"
 
-VALVE_ACTUATORS_CONNECTED = False
+VALVE_ACTUATORS_CONNECTED = True
 VALVE_TRAVEL_TIME = 45  # seconds — adjust after testing with actual GV-24 actuator
 STATE_FILE = "/home/pi/pool_state.json"
 GPIO_CHIP  = "/dev/gpiochip0"
@@ -101,7 +101,9 @@ state = {
     "heater_relay_on":          False,
     "water_temp":               None,
     "setpoint":                 SETPOINT_DEFAULT,
-    "valve_position":           "pool",
+    "valve_position":           "pool",   # combined — "pool"/"spa"/"split"
+    "valve_a_position":         "pool",   # Valve A individual position
+    "valve_b_position":         "pool",   # Valve B individual position
     "sensor_unavailable_since": None,
     "pump_should_run":          False,   # From Node-RED schedule (bigtimer)
     "pump_is_on":               False,   # Actual pump state from HA
@@ -116,9 +118,11 @@ state = {
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 mqtt_connected = False
 
-# Valve movement lock — prevents simultaneous actuator activation
-_valve_moving = False
-_valve_lock   = threading.Lock()
+# Valve movement locks — one per actuator, prevents simultaneous activation
+_valve_a_moving = False
+_valve_b_moving = False
+_valve_a_lock   = threading.Lock()
+_valve_b_lock   = threading.Lock()
 
 # -------------------------------------------------------
 # Persistent State
@@ -126,10 +130,12 @@ _valve_lock   = threading.Lock()
 
 def save_state():
     data = {
-        "setpoint":       state["setpoint"],
-        "heater_enabled": state["heater_enabled"],
-        "valve_position": state["valve_position"],
-        "standby":        state["standby"],
+        "setpoint":         state["setpoint"],
+        "heater_enabled":   state["heater_enabled"],
+        "valve_position":   state["valve_position"],
+        "valve_a_position": state["valve_a_position"],
+        "valve_b_position": state["valve_b_position"],
+        "standby":          state["standby"],
     }
     try:
         with open(STATE_FILE, "w") as f:
@@ -144,10 +150,12 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
-        state["setpoint"]       = float(data.get("setpoint", SETPOINT_DEFAULT))
-        state["heater_enabled"] = bool(data.get("heater_enabled", False))
-        state["valve_position"] = data.get("valve_position", "pool")
-        state["standby"]        = bool(data.get("standby", False))
+        state["setpoint"]         = float(data.get("setpoint", SETPOINT_DEFAULT))
+        state["heater_enabled"]   = bool(data.get("heater_enabled", False))
+        state["valve_position"]   = data.get("valve_position", "pool")
+        state["valve_a_position"] = data.get("valve_a_position", state["valve_position"])
+        state["valve_b_position"] = data.get("valve_b_position", state["valve_position"])
+        state["standby"]          = bool(data.get("standby", False))
         log.info(f"State restored: setpoint={state['setpoint']}, heater={state['heater_enabled']}, valve={state['valve_position']}, standby={state['standby']}")
     except Exception as e:
         log.warning(f"Failed to load state: {e}")
@@ -335,69 +343,134 @@ def set_heater_relay(on: bool):
     _set_output(PIN_HEATER_RELAY, on)
     log.info(f"Heater relay: {'ON' if on else 'OFF'}")
 
-def set_valve(position: str):
-    """Set valve position.
-    Stage 3: drives relay with movement lock when VALVE_ACTUATORS_CONNECTED = True.
-    Always safe — never allows both relays on simultaneously.
-    Ignores requests while actuator is already moving.
+def _move_single_valve(valve: str, position: str):
     """
-    global _valve_moving
+    Move one valve actuator to position.
+      valve:    'a' or 'b'
+      position: 'pool' or 'spa'
+    Runs the relay pulse in a background thread.
+    Returns False immediately if the actuator is already moving.
 
-    if position not in ("pool", "spa"):
-        log.warning(f"Invalid valve position: {position}")
-        return
+    Direction wiring (GVA-24):
+      White wire = SPA  direction → OPEN  relay (PIN_VALVE_OPEN / PIN_VALVE_B_OPEN)
+      Red   wire = POOL direction → CLOSE relay (PIN_VALVE_CLOSE / PIN_VALVE_B_CLOSE)
+    """
+    global _valve_a_moving, _valve_b_moving
 
-    if not VALVE_ACTUATORS_CONNECTED:
-        state["valve_position"] = position
-        log.info(f"Valve position set to: {position}")
-        log.info("Valve actuators not connected — software state only")
-        save_state()
-        publish_state()
-        update_display()
-        return
+    if valve == 'a':
+        open_pin  = PIN_VALVE_OPEN
+        close_pin = PIN_VALVE_CLOSE
+        lock      = _valve_a_lock
+        pos_key   = 'valve_a_position'
+    else:
+        open_pin  = PIN_VALVE_B_OPEN
+        close_pin = PIN_VALVE_B_CLOSE
+        lock      = _valve_b_lock
+        pos_key   = 'valve_b_position'
 
-    if _valve_moving:
-        log.warning(f"Valve move to {position} ignored — actuator already moving")
-        return
+    currently_moving = _valve_a_moving if valve == 'a' else _valve_b_moving
+    if currently_moving:
+        log.warning(f"Valve {valve.upper()} move to {position} ignored — already moving")
+        return False
 
-    if position == state["valve_position"]:
-        log.info(f"Valve already in {position} position — no movement needed")
-        return
+    if position == state[pos_key]:
+        log.info(f"Valve {valve.upper()} already in {position} — no movement needed")
+        return True
 
     def _do_move():
-        global _valve_moving
-        with _valve_lock:
-            _valve_moving = True
-            log.info(f"Valve moving to: {position}")
+        global _valve_a_moving, _valve_b_moving
+        with lock:
+            if valve == 'a':
+                _valve_a_moving = True
+            else:
+                _valve_b_moving = True
+
+            log.info(f"Valve {valve.upper()} moving to: {position}")
+            state_topic = f"pool/state/valve_{'a' if valve == 'a' else 'b'}_position"
             if mqtt_connected:
-                mqtt_client.publish("pool/state/valve_position", "transitioning", retain=True)
+                mqtt_client.publish(state_topic, "transitioning", retain=True)
             update_display()
+
             try:
-                _set_output(PIN_VALVE_OPEN,    False)
-                _set_output(PIN_VALVE_CLOSE,   False)
-                _set_output(PIN_VALVE_B_OPEN,  False)
-                _set_output(PIN_VALVE_B_CLOSE, False)
+                _set_output(open_pin,  False)
+                _set_output(close_pin, False)
                 time.sleep(0.1)
                 if position == "pool":
-                    _set_output(PIN_VALVE_OPEN,   True)
-                    _set_output(PIN_VALVE_B_OPEN, True)
+                    _set_output(close_pin, True)   # Red wire = POOL direction
                 else:
-                    _set_output(PIN_VALVE_CLOSE,   True)
-                    _set_output(PIN_VALVE_B_CLOSE, True)
+                    _set_output(open_pin, True)    # White wire = SPA direction
                 time.sleep(VALVE_TRAVEL_TIME)
             finally:
-                _set_output(PIN_VALVE_OPEN,    False)
-                _set_output(PIN_VALVE_CLOSE,   False)
-                _set_output(PIN_VALVE_B_OPEN,  False)
-                _set_output(PIN_VALVE_B_CLOSE, False)
-                _valve_moving = False
-            state["valve_position"] = position
-            log.info(f"Valve move complete: {position}")
+                _set_output(open_pin,  False)
+                _set_output(close_pin, False)
+                if valve == 'a':
+                    _valve_a_moving = False
+                else:
+                    _valve_b_moving = False
+
+            state[pos_key] = position
+            # Update combined valve_position
+            if state['valve_a_position'] == state['valve_b_position']:
+                state['valve_position'] = state['valve_a_position']
+            else:
+                state['valve_position'] = 'split'
+            log.info(f"Valve {valve.upper()} move complete: {position}")
             save_state()
             publish_state()
             update_display()
 
     threading.Thread(target=_do_move, daemon=True).start()
+    return True
+
+
+def set_valve(position: str):
+    """Move BOTH valve actuators to position (Pool/Spa button behavior)."""
+    if position not in ("pool", "spa"):
+        log.warning(f"Invalid valve position: {position}")
+        return
+
+    if not VALVE_ACTUATORS_CONNECTED:
+        state["valve_position"]   = position
+        state["valve_a_position"] = position
+        state["valve_b_position"] = position
+        log.info(f"Valve position set to: {position} (software state only)")
+        save_state()
+        publish_state()
+        update_display()
+        return
+
+    _move_single_valve('a', position)
+    _move_single_valve('b', position)
+
+
+def move_valve_a(position: str):
+    """Move Valve A only — HA individual control, no heater side effects."""
+    if not VALVE_ACTUATORS_CONNECTED:
+        state["valve_a_position"] = position
+        if state["valve_a_position"] == state["valve_b_position"]:
+            state["valve_position"] = position
+        else:
+            state["valve_position"] = "split"
+        save_state()
+        publish_state()
+        update_display()
+        return
+    _move_single_valve('a', position)
+
+
+def move_valve_b(position: str):
+    """Move Valve B only — HA individual control, no heater side effects."""
+    if not VALVE_ACTUATORS_CONNECTED:
+        state["valve_b_position"] = position
+        if state["valve_a_position"] == state["valve_b_position"]:
+            state["valve_position"] = position
+        else:
+            state["valve_position"] = "split"
+        save_state()
+        publish_state()
+        update_display()
+        return
+    _move_single_valve('b', position)
 
 # -------------------------------------------------------
 # Control Loop
@@ -447,6 +520,8 @@ def publish_state():
         "pool/state/heater_relay":    "ON"  if state["heater_relay_on"] else "OFF",
         "pool/sensor/setpoint":       str(state["setpoint"]),
         "pool/state/valve_position":  state["valve_position"],
+        "pool/state/valve_a_position": state["valve_a_position"],
+        "pool/state/valve_b_position": state["valve_b_position"],
         "pool/state/standby":         "ON"  if state["standby"]         else "OFF",
     }
     if state["water_temp"] is not None:
@@ -493,9 +568,22 @@ def publish_discovery():
             "unique_id": "pool_heater_relay_01", "device": device,
         }),
         ("homeassistant/select/pool_valve_position/config", {
-            "name": "Pool Valve Position", "state_topic": "pool/state/valve_position",
-            "command_topic": "pool/cmd/valve", "options": ["pool", "spa", "transitioning"],
+            "name": "Pool Valves (Both)", "state_topic": "pool/state/valve_position",
+            "command_topic": "pool/cmd/valve",
+            "options": ["pool", "spa", "transitioning", "split"],
             "unique_id": "pool_valve_position_01", "device": device,
+        }),
+        ("homeassistant/select/pool_valve_a/config", {
+            "name": "Pool Valve A (Suction)", "state_topic": "pool/state/valve_a_position",
+            "command_topic": "pool/cmd/valve_a",
+            "options": ["pool", "spa", "transitioning"],
+            "unique_id": "pool_valve_a_01", "device": device,
+        }),
+        ("homeassistant/select/pool_valve_b/config", {
+            "name": "Pool Valve B (Return)", "state_topic": "pool/state/valve_b_position",
+            "command_topic": "pool/cmd/valve_b",
+            "options": ["pool", "spa", "transitioning"],
+            "unique_id": "pool_valve_b_01", "device": device,
         }),
         ("homeassistant/binary_sensor/pool_standby/config", {
             "name": "Pool Standby", "state_topic": "pool/state/standby",
@@ -536,6 +624,16 @@ def on_message(client, userdata, msg):
             set_valve(payload)
         else:
             log.warning(f"Invalid valve command: {payload}")
+    elif topic == "pool/cmd/valve_a":
+        if payload in ("pool", "spa"):
+            move_valve_a(payload)
+        else:
+            log.warning(f"Invalid valve_a command: {payload}")
+    elif topic == "pool/cmd/valve_b":
+        if payload in ("pool", "spa"):
+            move_valve_b(payload)
+        else:
+            log.warning(f"Invalid valve_b command: {payload}")
     elif topic == "pool/schedule/pump_should_run":
         state["pump_is_on"] = (payload.lower() == "on")
         log.info(f"Pump is on: {state['pump_is_on']}")
@@ -597,12 +695,14 @@ def update_display():
         return
     if state["standby"]:
         mode_text = "** STANDBY **"
-    elif _valve_moving:
+    elif _valve_a_moving or _valve_b_moving:
         mode_text = "Moving..."
-    elif state["valve_position"] == "pool":
+    elif state["valve_a_position"] == state["valve_b_position"] == "pool":
         mode_text = "Pool Mode"
-    else:
+    elif state["valve_a_position"] == state["valve_b_position"] == "spa":
         mode_text = "Spa Mode"
+    else:
+        mode_text = "Split Mode"
     heater_str  = "ON"  if state["heater_enabled"]  else "OFF"
     heating_str = "YES" if state["heater_relay_on"] else "NO"
     status_text = f"Heater:{heater_str}  Heat:{heating_str}"
