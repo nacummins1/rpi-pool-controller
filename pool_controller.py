@@ -369,56 +369,64 @@ def _move_single_valve(valve: str, position: str):
         lock      = _valve_b_lock
         pos_key   = 'valve_b_position'
 
+    # Acquire lock before checking/setting moving flag to prevent race condition
+    if not lock.acquire(blocking=False):
+        log.warning(f"Valve {valve.upper()} move to {position} ignored — already moving")
+        return False
+
     currently_moving = _valve_a_moving if valve == 'a' else _valve_b_moving
     if currently_moving:
+        lock.release()
         log.warning(f"Valve {valve.upper()} move to {position} ignored — already moving")
         return False
 
     if position == state[pos_key]:
+        lock.release()
         log.info(f"Valve {valve.upper()} already in {position} — no movement needed")
         return True
 
+    # Set moving flag immediately while holding lock, before spawning thread
+    if valve == 'a':
+        _valve_a_moving = True
+    else:
+        _valve_b_moving = True
+    lock.release()
+
     def _do_move():
         global _valve_a_moving, _valve_b_moving
-        with lock:
+        log.info(f"Valve {valve.upper()} moving to: {position}")
+        state_topic = f"pool/state/valve_{'a' if valve == 'a' else 'b'}_position"
+        if mqtt_connected:
+            mqtt_client.publish(state_topic, "transitioning", retain=True)
+        update_display()
+
+        try:
+            _set_output(open_pin,  False)
+            _set_output(close_pin, False)
+            time.sleep(0.1)
+            if position == "pool":
+                _set_output(close_pin, True)   # Red wire = POOL direction
+            else:
+                _set_output(open_pin, True)    # White wire = SPA direction
+            time.sleep(VALVE_TRAVEL_TIME)
+        finally:
+            _set_output(open_pin,  False)
+            _set_output(close_pin, False)
             if valve == 'a':
-                _valve_a_moving = True
+                _valve_a_moving = False
             else:
-                _valve_b_moving = True
+                _valve_b_moving = False
 
-            log.info(f"Valve {valve.upper()} moving to: {position}")
-            state_topic = f"pool/state/valve_{'a' if valve == 'a' else 'b'}_position"
-            if mqtt_connected:
-                mqtt_client.publish(state_topic, "transitioning", retain=True)
-            update_display()
-
-            try:
-                _set_output(open_pin,  False)
-                _set_output(close_pin, False)
-                time.sleep(0.1)
-                if position == "pool":
-                    _set_output(close_pin, True)   # Red wire = POOL direction
-                else:
-                    _set_output(open_pin, True)    # White wire = SPA direction
-                time.sleep(VALVE_TRAVEL_TIME)
-            finally:
-                _set_output(open_pin,  False)
-                _set_output(close_pin, False)
-                if valve == 'a':
-                    _valve_a_moving = False
-                else:
-                    _valve_b_moving = False
-
-            state[pos_key] = position
-            # Update combined valve_position
-            if state['valve_a_position'] == state['valve_b_position']:
-                state['valve_position'] = state['valve_a_position']
-            else:
-                state['valve_position'] = 'split'
-            log.info(f"Valve {valve.upper()} move complete: {position}")
-            save_state()
-            publish_state()
-            update_display()
+        state[pos_key] = position
+        # Update combined valve_position
+        if state['valve_a_position'] == state['valve_b_position']:
+            state['valve_position'] = state['valve_a_position']
+        else:
+            state['valve_position'] = 'split'
+        log.info(f"Valve {valve.upper()} move complete: {position}")
+        save_state()
+        publish_state()
+        update_display()
 
     threading.Thread(target=_do_move, daemon=True).start()
     return True
@@ -460,6 +468,7 @@ def set_valve(position: str):
                 # Spa: Return (B) first, then Suction (A)
                 log.info("Sequential move to SPA: B (return) first, then A (suction)")
                 _move_single_valve('b', position)
+                time.sleep(0.2)  # Allow thread to start and set moving flag
                 deadline = time.monotonic() + timeout_secs
                 while _valve_b_moving and time.monotonic() < deadline:
                     time.sleep(0.5)
@@ -471,6 +480,7 @@ def set_valve(position: str):
                 # Pool: Suction (A) first, then Return (B)
                 log.info("Sequential move to POOL: A (suction) first, then B (return)")
                 _move_single_valve('a', position)
+                time.sleep(0.2)  # Allow thread to start and set moving flag
                 deadline = time.monotonic() + timeout_secs
                 while _valve_a_moving and time.monotonic() < deadline:
                     time.sleep(0.5)
