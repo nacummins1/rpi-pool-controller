@@ -124,6 +124,7 @@ _valve_b_moving        = False
 _valve_a_lock          = threading.Lock()
 _valve_b_lock          = threading.Lock()
 _valve_sequence_moving = False  # System-level lock — blocks Pool/Spa buttons during full sequence
+_pending_pump_off      = False  # Set True when pool mode delays pump-off; cleared if spa is pressed
 
 # -------------------------------------------------------
 # Persistent State
@@ -870,6 +871,7 @@ def toggle_standby():
     update_display()
 
 def btn_pool_pressed():
+    global _pending_pump_off
     if state["standby"]:
         return
     if _valve_sequence_moving:
@@ -880,18 +882,31 @@ def btn_pool_pressed():
     state["setpoint"] = 80.0
     set_heater_relay(False)
     if mqtt_connected and not state["pump_should_run"]:
-        mqtt_client.publish("pool/cmd/pump", "OFF", retain=False)
-        log.info("Pool mode: past pump schedule — pump off command sent")
+        # Delay pump-off 30s to flush hot water from heater past the temp sensor
+        _pending_pump_off = True
+        log.info("Pool mode: pump off delayed 30s to flush heater backwash")
+        def _delayed_pump_off():
+            global _pending_pump_off
+            time.sleep(30)
+            if _pending_pump_off and mqtt_connected:
+                mqtt_client.publish("pool/cmd/pump", "OFF", retain=False)
+                log.info("Pool mode: delayed pump off command sent")
+            _pending_pump_off = False
+        threading.Thread(target=_delayed_pump_off, daemon=True).start()
     else:
         log.info("Pool mode: within pump schedule — pump left running")
     set_valve("pool")
 
 def btn_spa_pressed():
+    global _pending_pump_off
     if state["standby"]:
         return
     if _valve_sequence_moving:
         log.warning("Valve sequence in progress — spa button ignored")
         return
+    if _pending_pump_off:
+        _pending_pump_off = False
+        log.info("Spa mode: cancelled pending pool pump-off")
     log.info("Spa button pressed")
     state["heater_enabled"] = True
     state["setpoint"] = 100.0
