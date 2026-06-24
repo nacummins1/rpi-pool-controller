@@ -71,7 +71,7 @@ HYSTERESIS                 = 2.0
 CPU_TEMP_PATH = "/sys/class/thermal/thermal_zone0/temp"
 
 VALVE_ACTUATORS_CONNECTED = True
-VALVE_TRAVEL_TIME = 45  # seconds — adjust after testing with actual GV-24 actuator
+VALVE_TRAVEL_TIME = 32  # seconds — measured 26s actual travel, 32s adds safety margin
 STATE_FILE = "/home/pi/pool_state.json"
 GPIO_CHIP  = "/dev/gpiochip0"
 
@@ -424,7 +424,10 @@ def _move_single_valve(valve: str, position: str):
 
 
 def set_valve(position: str):
-    """Move BOTH valve actuators to position (Pool/Spa button behavior)."""
+    """Move BOTH valve actuators to position sequentially (Pool/Spa button behavior).
+    Spa mode:  Return (B) moves first, then Suction (A) — prevents hot tub level drop.
+    Pool mode: Suction (A) moves first, then Return (B).
+    """
     if position not in ("pool", "spa"):
         log.warning(f"Invalid valve position: {position}")
         return
@@ -439,8 +442,25 @@ def set_valve(position: str):
         update_display()
         return
 
-    _move_single_valve('a', position)
-    _move_single_valve('b', position)
+    def _sequential_move():
+        if position == "spa":
+            # Spa: Return (B) first, then Suction (A)
+            log.info("Sequential move to SPA: B (return) first, then A (suction)")
+            _move_single_valve('b', position)
+            # Wait for B to complete before starting A
+            while _valve_b_moving:
+                time.sleep(0.5)
+            _move_single_valve('a', position)
+        else:
+            # Pool: Suction (A) first, then Return (B)
+            log.info("Sequential move to POOL: A (suction) first, then B (return)")
+            _move_single_valve('a', position)
+            # Wait for A to complete before starting B
+            while _valve_a_moving:
+                time.sleep(0.5)
+            _move_single_valve('b', position)
+
+    threading.Thread(target=_sequential_move, daemon=True).start()
 
 
 def move_valve_a(position: str):
