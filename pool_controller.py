@@ -656,6 +656,18 @@ def publish_discovery():
             "icon": "mdi:power-standby",
             "unique_id": "pool_standby_01", "device": device,
         }),
+        ("homeassistant/button/pool_mode/config", {
+            "name": "Pool Mode", "command_topic": "pool/cmd/mode",
+            "payload_press": "pool",
+            "icon": "mdi:pool",
+            "unique_id": "pool_mode_button_01", "device": device,
+        }),
+        ("homeassistant/button/spa_mode/config", {
+            "name": "Spa Mode", "command_topic": "pool/cmd/mode",
+            "payload_press": "spa",
+            "icon": "mdi:hot-tub",
+            "unique_id": "spa_mode_button_01", "device": device,
+        }),
     ]
     # Clear stale binary_sensor standby discovery (replaced by switch in newer version)
     mqtt_client.publish("homeassistant/binary_sensor/pool_standby/config", "", retain=True)
@@ -713,6 +725,13 @@ def on_message(client, userdata, msg):
             toggle_standby()
         else:
             publish_state()
+    elif topic == "pool/cmd/mode":
+        if payload == "pool":
+            btn_pool_pressed()
+        elif payload == "spa":
+            btn_spa_pressed()
+        else:
+            log.warning(f"Invalid mode command: {payload}")
     elif topic == "pool/schedule/pump_should_run":
         state["pump_is_on"] = (payload.lower() == "on")
         log.info(f"Pump is on: {state['pump_is_on']}")
