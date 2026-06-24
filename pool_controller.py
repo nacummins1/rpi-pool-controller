@@ -339,7 +339,9 @@ def _monitor_buttons():
 # -------------------------------------------------------
 
 def set_heater_relay(on: bool):
-    """Set heater relay state. Always writes to GPIO."""
+    """Set heater relay state. Only writes/logs when the state actually changes."""
+    if state["heater_relay_on"] == on:
+        return  # Already in this state — skip redundant GPIO write and log
     state["heater_relay_on"] = on
     _set_output(PIN_HEATER_RELAY, on)
     log.info(f"Heater relay: {'ON' if on else 'OFF'}")
@@ -496,6 +498,9 @@ def set_valve(position: str):
 
 def move_valve_a(position: str):
     """Move Valve A only — HA individual control, no heater side effects."""
+    if _valve_sequence_moving:
+        log.warning("Valve sequence in progress — valve_a command ignored")
+        return
     if not VALVE_ACTUATORS_CONNECTED:
         state["valve_a_position"] = position
         if state["valve_a_position"] == state["valve_b_position"]:
@@ -511,6 +516,9 @@ def move_valve_a(position: str):
 
 def move_valve_b(position: str):
     """Move Valve B only — HA individual control, no heater side effects."""
+    if _valve_sequence_moving:
+        log.warning("Valve sequence in progress — valve_b command ignored")
+        return
     if not VALVE_ACTUATORS_CONNECTED:
         state["valve_b_position"] = position
         if state["valve_a_position"] == state["valve_b_position"]:
