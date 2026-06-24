@@ -548,7 +548,7 @@ def control_loop():
                 log.info("Temp sensor recovered")
                 state["sensor_unavailable_since"] = None
             state["water_temp"] = temp
-            if state["heater_enabled"]:
+            if state["heater_enabled"] and not state["standby"]:
                 if temp < (state["setpoint"] - HYSTERESIS):
                     set_heater_relay(True)
                 elif temp > (state["setpoint"] + HYSTERESIS):
@@ -636,12 +636,17 @@ def publish_discovery():
             "options": ["pool", "spa", "transitioning"],
             "unique_id": "pool_valve_b_01", "device": device,
         }),
-        ("homeassistant/binary_sensor/pool_standby/config", {
+        ("homeassistant/switch/pool_standby/config", {
             "name": "Pool Standby", "state_topic": "pool/state/standby",
+            "command_topic": "pool/cmd/standby",
             "payload_on": "ON", "payload_off": "OFF",
+            "icon": "mdi:power-standby",
             "unique_id": "pool_standby_01", "device": device,
         }),
     ]
+    # Clear stale binary_sensor standby discovery (replaced by switch in newer version)
+    mqtt_client.publish("homeassistant/binary_sensor/pool_standby/config", "", retain=True)
+
     for topic, payload in entities:
         mqtt_client.publish(topic, json.dumps(payload), retain=True)
         log.info(f"Discovery published: {topic}")
@@ -655,6 +660,10 @@ def on_message(client, userdata, msg):
     payload = msg.payload.decode().strip()
     log.info(f"MQTT command: {topic} = {payload}")
     if topic == "pool/cmd/heater_enabled":
+        if state["standby"]:
+            log.warning("Standby active — heater enable command ignored")
+            publish_state()
+            return
         state["heater_enabled"] = (payload == "ON")
         if not state["heater_enabled"]:
             set_heater_relay(False)
@@ -685,6 +694,12 @@ def on_message(client, userdata, msg):
             move_valve_b(payload)
         else:
             log.warning(f"Invalid valve_b command: {payload}")
+    elif topic == "pool/cmd/standby":
+        desired = (payload == "ON")
+        if desired != state["standby"]:
+            toggle_standby()
+        else:
+            publish_state()
     elif topic == "pool/schedule/pump_should_run":
         state["pump_is_on"] = (payload.lower() == "on")
         log.info(f"Pump is on: {state['pump_is_on']}")
