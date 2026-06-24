@@ -119,10 +119,11 @@ mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 mqtt_connected = False
 
 # Valve movement locks — one per actuator, prevents simultaneous activation
-_valve_a_moving = False
-_valve_b_moving = False
-_valve_a_lock   = threading.Lock()
-_valve_b_lock   = threading.Lock()
+_valve_a_moving        = False
+_valve_b_moving        = False
+_valve_a_lock          = threading.Lock()
+_valve_b_lock          = threading.Lock()
+_valve_sequence_moving = False  # System-level lock — blocks Pool/Spa buttons during full sequence
 
 # -------------------------------------------------------
 # Persistent State
@@ -427,7 +428,10 @@ def set_valve(position: str):
     """Move BOTH valve actuators to position sequentially (Pool/Spa button behavior).
     Spa mode:  Return (B) moves first, then Suction (A) — prevents hot tub level drop.
     Pool mode: Suction (A) moves first, then Return (B).
+    Blocked if a sequence is already in progress.
     """
+    global _valve_sequence_moving
+
     if position not in ("pool", "spa"):
         log.warning(f"Invalid valve position: {position}")
         return
@@ -442,23 +446,40 @@ def set_valve(position: str):
         update_display()
         return
 
+    if _valve_sequence_moving:
+        log.warning(f"Valve sequence already in progress — {position} request ignored")
+        return
+
+    timeout_secs = VALVE_TRAVEL_TIME + 10  # Travel time + 10s safety buffer
+
     def _sequential_move():
-        if position == "spa":
-            # Spa: Return (B) first, then Suction (A)
-            log.info("Sequential move to SPA: B (return) first, then A (suction)")
-            _move_single_valve('b', position)
-            # Wait for B to complete before starting A
-            while _valve_b_moving:
-                time.sleep(0.5)
-            _move_single_valve('a', position)
-        else:
-            # Pool: Suction (A) first, then Return (B)
-            log.info("Sequential move to POOL: A (suction) first, then B (return)")
-            _move_single_valve('a', position)
-            # Wait for A to complete before starting B
-            while _valve_a_moving:
-                time.sleep(0.5)
-            _move_single_valve('b', position)
+        global _valve_sequence_moving
+        _valve_sequence_moving = True
+        try:
+            if position == "spa":
+                # Spa: Return (B) first, then Suction (A)
+                log.info("Sequential move to SPA: B (return) first, then A (suction)")
+                _move_single_valve('b', position)
+                deadline = time.monotonic() + timeout_secs
+                while _valve_b_moving and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                if _valve_b_moving:
+                    log.error("Valve B timed out during SPA sequence — aborting")
+                    return
+                _move_single_valve('a', position)
+            else:
+                # Pool: Suction (A) first, then Return (B)
+                log.info("Sequential move to POOL: A (suction) first, then B (return)")
+                _move_single_valve('a', position)
+                deadline = time.monotonic() + timeout_secs
+                while _valve_a_moving and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                if _valve_a_moving:
+                    log.error("Valve A timed out during POOL sequence — aborting")
+                    return
+                _move_single_valve('b', position)
+        finally:
+            _valve_sequence_moving = False
 
     threading.Thread(target=_sequential_move, daemon=True).start()
 
@@ -794,6 +815,9 @@ def toggle_standby():
 def btn_pool_pressed():
     if state["standby"]:
         return
+    if _valve_sequence_moving:
+        log.warning("Valve sequence in progress — pool button ignored")
+        return
     log.info("Pool button pressed")
     state["heater_enabled"] = False
     state["setpoint"] = 80.0
@@ -807,6 +831,9 @@ def btn_pool_pressed():
 
 def btn_spa_pressed():
     if state["standby"]:
+        return
+    if _valve_sequence_moving:
+        log.warning("Valve sequence in progress — spa button ignored")
         return
     log.info("Spa button pressed")
     state["heater_enabled"] = True
