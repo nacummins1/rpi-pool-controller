@@ -537,34 +537,39 @@ def move_valve_b(position: str):
 
 def control_loop():
     while True:
-        state["cpu_temp"] = read_cpu_temp()
-        temp = read_temperature()
-        if temp is None:
-            if state["sensor_unavailable_since"] is None:
-                state["sensor_unavailable_since"] = time.time()
-                log.warning("Temp sensor unavailable — watchdog started")
-            elif state["sensor_unavailable_since"] != -1 and \
-                 time.time() - state["sensor_unavailable_since"] > SENSOR_UNAVAILABLE_TIMEOUT:
-                log.error("Sensor unavailable > 3 min — forcing heater off")
-                set_heater_relay(False)
-                state["sensor_unavailable_since"] = -1
-            mqtt_client.publish("pool/sensor/water_temp", "unavailable", retain=True)
-            publish_state()
-            update_display()
-        else:
-            if state["sensor_unavailable_since"] is not None:
-                log.info("Temp sensor recovered")
-                state["sensor_unavailable_since"] = None
-            state["water_temp"] = temp
-            if state["heater_enabled"] and not state["standby"]:
-                if temp < (state["setpoint"] - HYSTERESIS):
-                    set_heater_relay(True)
-                elif temp > (state["setpoint"] + HYSTERESIS):
+        try:
+            state["cpu_temp"] = read_cpu_temp()
+            temp = read_temperature()
+            if temp is None:
+                if state["sensor_unavailable_since"] is None:
+                    state["sensor_unavailable_since"] = time.time()
+                    log.warning("Temp sensor unavailable — watchdog started")
+                elif state["sensor_unavailable_since"] != -1 and \
+                     time.time() - state["sensor_unavailable_since"] > SENSOR_UNAVAILABLE_TIMEOUT:
+                    log.error("Sensor unavailable > 3 min — forcing heater off")
                     set_heater_relay(False)
+                    state["sensor_unavailable_since"] = -1
+                mqtt_client.publish("pool/sensor/water_temp", "unavailable", retain=True)
+                publish_state()
+                update_display()
             else:
-                set_heater_relay(False)
-            publish_state()
-            update_display()
+                if state["sensor_unavailable_since"] is not None:
+                    log.info("Temp sensor recovered")
+                    state["sensor_unavailable_since"] = None
+                state["water_temp"] = temp
+                if state["heater_enabled"] and not state["standby"]:
+                    if temp < (state["setpoint"] - HYSTERESIS):
+                        set_heater_relay(True)
+                    elif temp > (state["setpoint"] + HYSTERESIS):
+                        set_heater_relay(False)
+                else:
+                    set_heater_relay(False)
+                publish_state()
+                update_display()
+        except Exception as e:
+            # Never let an unhandled exception kill the control thread —
+            # that would silently stop heater regulation. Log and continue.
+            log.error(f"Control loop iteration error: {e}", exc_info=True)
         time.sleep(CONTROL_LOOP_INTERVAL)
 
 # -------------------------------------------------------
@@ -907,7 +912,22 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         log.info("Shutting down...")
-        set_heater_relay(False)
+    except Exception as e:
+        log.error(f"Fatal error in main loop: {e}", exc_info=True)
+    finally:
+        # Fail-safe: force all relays OFF on ANY exit (clean, interrupt, or crash).
+        # Write pins directly rather than via set_heater_relay(), which may early-return
+        # if in-memory state is stale after a crash.
+        try:
+            if _output_lines:
+                _set_output(PIN_HEATER_RELAY,  False)
+                _set_output(PIN_VALVE_OPEN,    False)
+                _set_output(PIN_VALVE_CLOSE,   False)
+                _set_output(PIN_VALVE_B_OPEN,  False)
+                _set_output(PIN_VALVE_B_CLOSE, False)
+                log.info("Fail-safe: all relays forced OFF")
+        except Exception as e:
+            log.error(f"Error forcing relays off during shutdown: {e}")
         mqtt_client.loop_stop()
         if _output_lines:
             _output_lines.release()
