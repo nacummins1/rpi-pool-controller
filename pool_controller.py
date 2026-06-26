@@ -124,7 +124,15 @@ _valve_b_moving        = False
 _valve_a_lock          = threading.Lock()
 _valve_b_lock          = threading.Lock()
 _valve_sequence_moving = False  # System-level lock — blocks Pool/Spa buttons during full sequence
-_pending_pump_off      = False  # Set True when pool mode delays pump-off; cleared if spa is pressed
+
+# Pump-off token: each pool press increments under lock and captures the new value.
+# The delayed thread only fires if its captured token still matches at wake time.
+# Spa press also increments, invalidating any in-flight pool pump-off.
+_pump_off_token        = 0
+_pump_off_lock         = threading.Lock()
+
+# OLED display serialization — multiple threads can trigger update_display()
+_display_lock          = threading.Lock()
 
 # -------------------------------------------------------
 # Persistent State
@@ -152,7 +160,8 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
-        state["setpoint"]         = float(data.get("setpoint", SETPOINT_DEFAULT))
+        loaded_sp                 = float(data.get("setpoint", SETPOINT_DEFAULT))
+        state["setpoint"]         = max(SETPOINT_MIN, min(SETPOINT_MAX, loaded_sp))
         state["heater_enabled"]   = bool(data.get("heater_enabled", False))
         state["valve_position"]   = data.get("valve_position", "pool")
         state["valve_a_position"] = data.get("valve_a_position", state["valve_position"])
@@ -347,11 +356,13 @@ def set_heater_relay(on: bool):
     _set_output(PIN_HEATER_RELAY, on)
     log.info(f"Heater relay: {'ON' if on else 'OFF'}")
 
-def _move_single_valve(valve: str, position: str):
+def _move_single_valve(valve: str, position: str, in_sequence: bool = False):
     """
     Move one valve actuator to position.
-      valve:    'a' or 'b'
-      position: 'pool' or 'spa'
+      valve:       'a' or 'b'
+      position:    'pool' or 'spa'
+      in_sequence: True when called from _sequential_move — skips combined-state
+                   recompute and persistence so the sequence owner reconciles once.
     Runs the relay pulse in a background thread.
     Returns False immediately if the actuator is already moving.
 
@@ -415,21 +426,32 @@ def _move_single_valve(valve: str, position: str):
         finally:
             _set_output(open_pin,  False)
             _set_output(close_pin, False)
-            if valve == 'a':
-                _valve_a_moving = False
-            else:
-                _valve_b_moving = False
+            # Re-acquire the per-valve lock when clearing the moving flag —
+            # symmetric with the True-assignment made under the lock above.
+            with lock:
+                if valve == 'a':
+                    _valve_a_moving = False
+                else:
+                    _valve_b_moving = False
 
         state[pos_key] = position
-        # Update combined valve_position
-        if state['valve_a_position'] == state['valve_b_position']:
-            state['valve_position'] = state['valve_a_position']
-        else:
-            state['valve_position'] = 'split'
         log.info(f"Valve {valve.upper()} move complete: {position}")
-        save_state()
-        publish_state()
-        update_display()
+        if not in_sequence:
+            # Standalone move: recompute combined and persist/publish/display now.
+            if state['valve_a_position'] == state['valve_b_position']:
+                state['valve_position'] = state['valve_a_position']
+            else:
+                state['valve_position'] = 'split'
+            save_state()
+            publish_state()
+            update_display()
+        else:
+            # In a sequence: publish just this valve's individual state.
+            # _sequential_move handles combined reconciliation + save_state at the end.
+            if mqtt_connected:
+                ind_topic = f"pool/state/valve_{valve}_position"
+                mqtt_client.publish(ind_topic, position, retain=True)
+            update_display()
 
     threading.Thread(target=_do_move, daemon=True).start()
     return True
@@ -466,11 +488,16 @@ def set_valve(position: str):
     def _sequential_move():
         global _valve_sequence_moving
         _valve_sequence_moving = True
+        # Mark combined state as transitioning up front so HA reflects the in-flight sequence.
+        state['valve_position'] = 'transitioning'
+        if mqtt_connected:
+            mqtt_client.publish("pool/state/valve_position", "transitioning", retain=True)
+        update_display()
         try:
             if position == "spa":
                 # Spa: Return (B) first, then Suction (A)
                 log.info("Sequential move to SPA: B (return) first, then A (suction)")
-                _move_single_valve('b', position)
+                _move_single_valve('b', position, in_sequence=True)
                 time.sleep(0.2)  # Allow thread to start and set moving flag
                 deadline = time.monotonic() + timeout_secs
                 while _valve_b_moving and time.monotonic() < deadline:
@@ -478,11 +505,18 @@ def set_valve(position: str):
                 if _valve_b_moving:
                     log.error("Valve B timed out during SPA sequence — aborting")
                     return
-                _move_single_valve('a', position)
+                _move_single_valve('a', position, in_sequence=True)
+                # Wait for A so the final reconcile reflects the completed state.
+                time.sleep(0.2)
+                deadline = time.monotonic() + timeout_secs
+                while _valve_a_moving and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                if _valve_a_moving:
+                    log.error("Valve A timed out during SPA sequence — final state may be split")
             else:
                 # Pool: Suction (A) first, then Return (B)
                 log.info("Sequential move to POOL: A (suction) first, then B (return)")
-                _move_single_valve('a', position)
+                _move_single_valve('a', position, in_sequence=True)
                 time.sleep(0.2)  # Allow thread to start and set moving flag
                 deadline = time.monotonic() + timeout_secs
                 while _valve_a_moving and time.monotonic() < deadline:
@@ -490,8 +524,23 @@ def set_valve(position: str):
                 if _valve_a_moving:
                     log.error("Valve A timed out during POOL sequence — aborting")
                     return
-                _move_single_valve('b', position)
+                _move_single_valve('b', position, in_sequence=True)
+                # Wait for B so the final reconcile reflects the completed state.
+                time.sleep(0.2)
+                deadline = time.monotonic() + timeout_secs
+                while _valve_b_moving and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                if _valve_b_moving:
+                    log.error("Valve B timed out during POOL sequence — final state may be split")
         finally:
+            # Reconcile combined state once after the sequence (success, abort, or timeout).
+            if state['valve_a_position'] == state['valve_b_position']:
+                state['valve_position'] = state['valve_a_position']
+            else:
+                state['valve_position'] = 'split'
+            save_state()
+            publish_state()
+            update_display()
             _valve_sequence_moving = False
 
     threading.Thread(target=_sequential_move, daemon=True).start()
@@ -816,12 +865,13 @@ def update_display():
     arr_x   = cur_x + cur_w + 3
     set_x   = arr_x + arr_w + 3
     try:
-        with canvas(display_device) as draw:
-            draw.text((center_x(mode_text,   font_small), 0),  mode_text,   font=font_small, fill="white")
-            draw.text((center_x(status_text, font_small), 14), status_text, font=font_small, fill="white")
-            draw.text((cur_x, 36), current,  font=font_large, fill="white")
-            draw.text((arr_x, 40), "\u2192", font=font_small, fill="white")
-            draw.text((set_x, 36), setpoint, font=font_large, fill="white")
+        with _display_lock:
+            with canvas(display_device) as draw:
+                draw.text((center_x(mode_text,   font_small), 0),  mode_text,   font=font_small, fill="white")
+                draw.text((center_x(status_text, font_small), 14), status_text, font=font_small, fill="white")
+                draw.text((cur_x, 36), current,  font=font_large, fill="white")
+                draw.text((arr_x, 40), "\u2192", font=font_small, fill="white")
+                draw.text((set_x, 36), setpoint, font=font_large, fill="white")
     except Exception as e:
         log.error(f"Display update error: {e}")
 
@@ -871,7 +921,7 @@ def toggle_standby():
     update_display()
 
 def btn_pool_pressed():
-    global _pending_pump_off
+    global _pump_off_token
     if state["standby"]:
         return
     if _valve_sequence_moving:
@@ -881,35 +931,52 @@ def btn_pool_pressed():
     state["heater_enabled"] = False
     state["setpoint"] = 80.0
     set_heater_relay(False)
+    # Persist + publish immediately so HA and the OLED reflect heater/setpoint
+    # changes without waiting for the (potentially 64s) valve sequence to complete.
+    save_state()
+    publish_state()
+    update_display()
     if mqtt_connected and not state["pump_should_run"]:
-        # Delay pump-off 30s to flush hot water from heater past the temp sensor
-        _pending_pump_off = True
-        log.info("Pool mode: pump off delayed 30s to flush heater backwash")
+        # Delay pump-off 30s to flush hot water from heater past the temp sensor.
+        # Each press captures its own token under lock; the delayed thread only
+        # fires if its captured token still matches at wake time, so a later
+        # press (pool or spa) cleanly invalidates earlier pending pump-offs.
+        with _pump_off_lock:
+            _pump_off_token += 1
+            my_token = _pump_off_token
+        log.info(f"Pool mode: pump off delayed 30s to flush heater backwash (token={my_token})")
         def _delayed_pump_off():
-            global _pending_pump_off
             time.sleep(30)
-            if _pending_pump_off and mqtt_connected:
+            with _pump_off_lock:
+                still_current = (_pump_off_token == my_token)
+            if still_current and mqtt_connected:
                 mqtt_client.publish("pool/cmd/pump", "OFF", retain=False)
-                log.info("Pool mode: delayed pump off command sent")
-            _pending_pump_off = False
+                log.info(f"Pool mode: delayed pump off command sent (token={my_token})")
+            elif not still_current:
+                log.info(f"Pool mode: pump-off token {my_token} superseded — no-op")
         threading.Thread(target=_delayed_pump_off, daemon=True).start()
     else:
         log.info("Pool mode: within pump schedule — pump left running")
     set_valve("pool")
 
 def btn_spa_pressed():
-    global _pending_pump_off
+    global _pump_off_token
     if state["standby"]:
         return
     if _valve_sequence_moving:
         log.warning("Valve sequence in progress — spa button ignored")
         return
-    if _pending_pump_off:
-        _pending_pump_off = False
-        log.info("Spa mode: cancelled pending pool pump-off")
+    # Bump pump-off token so any in-flight pool pump-off thread no-ops at wake time.
+    with _pump_off_lock:
+        _pump_off_token += 1
     log.info("Spa button pressed")
     state["heater_enabled"] = True
     state["setpoint"] = 100.0
+    # Persist + publish immediately so HA and the OLED reflect heater/setpoint
+    # changes without waiting for the (potentially 64s) valve sequence to complete.
+    save_state()
+    publish_state()
+    update_display()
     if mqtt_connected:
         mqtt_client.publish("pool/cmd/pump", "ON", retain=False)
         log.info("Spa mode: heater on, setpoint 100, pump on command sent")
