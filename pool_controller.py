@@ -53,10 +53,21 @@ log = logging.getLogger("pool")
 # Configuration
 # -------------------------------------------------------
 
-BROKER_IP   = "192.168.1.13"
-BROKER_PORT = 1883
-BROKER_USER = "mqtt"
-BROKER_PASS = "codex123"
+# MQTT broker credentials — read from environment (injected by systemd via
+# EnvironmentFile=/etc/pool-controller/env). BROKER_PASS is required; the
+# service refuses to start if it isn't set. The other three have fall-back
+# defaults matching the original deployment, so the service still works if
+# only the password env var is provided.
+BROKER_IP   = os.environ.get("POOL_MQTT_BROKER", "192.168.1.13")
+BROKER_PORT = int(os.environ.get("POOL_MQTT_PORT", "1883"))
+BROKER_USER = os.environ.get("POOL_MQTT_USER", "mqtt")
+BROKER_PASS = os.environ.get("POOL_MQTT_PASS")
+if not BROKER_PASS:
+    raise SystemExit(
+        "POOL_MQTT_PASS environment variable is required. "
+        "Set it in /etc/pool-controller/env (see README.md). "
+        "Service will not start without it."
+    )
 
 TEMP_SENSOR_PATH = "/sys/bus/w1/devices/28-00000025218c/w1_slave"
 

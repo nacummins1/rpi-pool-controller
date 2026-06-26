@@ -1,0 +1,24 @@
+# Local secrets — never commit
+*.env
+.env
+.env.*
+secrets.*
+.envrc
+
+# Local-only runtime state
+pool_state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Editor/OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
