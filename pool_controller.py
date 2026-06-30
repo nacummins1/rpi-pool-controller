@@ -69,6 +69,8 @@ if not BROKER_PASS:
         "Service will not start without it."
     )
 
+AVAILABILITY_TOPIC = "pool/state/availability"  # MQTT LWT + HA per-entity availability
+
 TEMP_SENSOR_GLOB = "/sys/bus/w1/devices/28-*/w1_slave"  # DS18B20 1-Wire devices
 
 SETPOINT_MIN     = 65.0
@@ -706,6 +708,14 @@ def publish_discovery():
         "model":        "RPi Pool Controller",
         "manufacturer": "Custom Build",
     }
+    # Availability config — applied to every entity below EXCEPT the connectivity
+    # binary_sensor itself, which must render "offline" as a real state (not be
+    # marked unavailable) so the offline-alert automation can trigger on it.
+    availability_cfg = {
+        "availability_topic":    AVAILABILITY_TOPIC,
+        "payload_available":     "online",
+        "payload_not_available": "offline",
+    }
     entities = [
         ("homeassistant/sensor/pool_water_temp/config", {
             "name": "Pool Water Temp", "state_topic": "pool/sensor/water_temp",
@@ -772,11 +782,29 @@ def publish_discovery():
             "icon": "mdi:hot-tub",
             "unique_id": "spa_mode_button_01", "device": device,
         }),
+        # Connectivity sensor: reflects the availability topic directly.
+        # No availability_cfg merged in — the entity must show OFF (not
+        # "unavailable") when the controller drops, so the offline-alert
+        # automation can trigger on its state going off.
+        ("homeassistant/binary_sensor/pool_controller_status/config", {
+            "name": "Pool Controller Status",
+            "state_topic":     AVAILABILITY_TOPIC,
+            "payload_on":      "online",
+            "payload_off":     "offline",
+            "device_class":    "connectivity",
+            "entity_category": "diagnostic",
+            "unique_id":       "pool_controller_status_01",
+            "device":          device,
+        }),
     ]
     # Clear stale binary_sensor standby discovery (replaced by switch in newer version)
     mqtt_client.publish("homeassistant/binary_sensor/pool_standby/config", "", retain=True)
 
     for topic, payload in entities:
+        # All entities except the connectivity sensor itself get availability_cfg
+        # merged in. HA then marks each as unavailable when the controller drops.
+        if "pool_controller_status" not in topic:
+            payload = {**payload, **availability_cfg}
         mqtt_client.publish(topic, json.dumps(payload), retain=True)
         log.info(f"Discovery published: {topic}")
 
@@ -848,6 +876,10 @@ def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
         mqtt_connected = True
         log.info(f"Connected to MQTT broker at {BROKER_IP}:{BROKER_PORT}")
+        # Mark availability as online — counterpart to the LWT 'offline' that
+        # the broker holds for us. Retained so HA picks it up immediately on
+        # its own restart, not just at the moment we connect.
+        client.publish(AVAILABILITY_TOPIC, "online", retain=True)
         client.subscribe("pool/cmd/#")
         client.subscribe("pool/schedule/pump_should_run")
         client.subscribe("pool/schedule/pump_in_schedule")
@@ -1052,9 +1084,16 @@ def main():
     mqtt_client.on_disconnect = on_disconnect
     mqtt_client.on_message    = on_message
     mqtt_client.reconnect_delay_set(min_delay=5, max_delay=60)
+    # Last Will: broker publishes 'offline' to the availability topic if we
+    # disconnect ungracefully (hard crash, power loss, network failure).
+    # HA marks every entity unavailable; the connectivity binary_sensor
+    # flips, triggering the offline-alert automation.
+    mqtt_client.will_set(AVAILABILITY_TOPIC, "offline", retain=True)
 
     try:
-        mqtt_client.connect(BROKER_IP, BROKER_PORT, keepalive=60)
+        # keepalive=30: broker declares the client dead after ~45s of silence
+        # (1.5× keepalive), so offline detection ≈ 45s + automation debounce.
+        mqtt_client.connect(BROKER_IP, BROKER_PORT, keepalive=30)
     except Exception as e:
         log.warning(f"Initial MQTT connect failed: {e} — will retry in background")
 
