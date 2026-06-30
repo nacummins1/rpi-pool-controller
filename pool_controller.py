@@ -69,7 +69,7 @@ if not BROKER_PASS:
         "Service will not start without it."
     )
 
-TEMP_SENSOR_PATH = "/sys/bus/w1/devices/28-00000025218c/w1_slave"
+TEMP_SENSOR_GLOB = "/sys/bus/w1/devices/28-*/w1_slave"  # DS18B20 1-Wire devices
 
 SETPOINT_MIN     = 65.0
 SETPOINT_MAX     = 104.0
@@ -78,6 +78,7 @@ SETPOINT_DEFAULT = 80.0
 SENSOR_UNAVAILABLE_TIMEOUT = 180
 CONTROL_LOOP_INTERVAL      = 10
 HYSTERESIS                 = 2.0
+SAVE_DEBOUNCE_SECONDS      = 2.0  # Coalesce rapid state writes (encoder rotation, setpoint slider)
 
 CPU_TEMP_PATH = "/sys/class/thermal/thermal_zone0/temp"
 
@@ -116,6 +117,7 @@ state = {
     "valve_a_position":         "pool",   # Valve A individual position
     "valve_b_position":         "pool",   # Valve B individual position
     "sensor_unavailable_since": None,
+    "sensor_watchdog_fired":    False,  # True once watchdog has fired and forced heater off
     "pump_should_run":          False,   # From Node-RED schedule (bigtimer)
     "pump_is_on":               False,   # Actual pump state from HA
     "standby":                  False,   # Standby mode — disables physical controls
@@ -144,6 +146,12 @@ _pump_off_lock         = threading.Lock()
 
 # OLED display serialization — multiple threads can trigger update_display()
 _display_lock          = threading.Lock()
+
+# Debounced state save — high-frequency mutations (encoder, setpoint slider)
+# schedule a write SAVE_DEBOUNCE_SECONDS in the future via save_state_soon();
+# each new call cancels and reschedules so rapid bursts coalesce to one write.
+_pending_save_timer    = None
+_save_timer_lock       = threading.Lock()
 
 # -------------------------------------------------------
 # Persistent State
@@ -182,16 +190,49 @@ def load_state():
     except Exception as e:
         log.warning(f"Failed to load state: {e}")
 
+def save_state_soon():
+    """Schedule a save_state() call SAVE_DEBOUNCE_SECONDS in the future.
+    Rapid successive calls coalesce: each new call cancels and reschedules,
+    so high-frequency mutations (encoder rotation, HA setpoint slider drags)
+    produce only one disk write after activity settles. Reduces SD-card wear.
+
+    Use this for any frequently-triggered state change. Discrete one-shot
+    events (button press, valve completion, standby toggle, heater toggle)
+    should call save_state() directly for synchronous persistence.
+    """
+    global _pending_save_timer
+    with _save_timer_lock:
+        if _pending_save_timer is not None:
+            _pending_save_timer.cancel()
+        _pending_save_timer = threading.Timer(SAVE_DEBOUNCE_SECONDS, save_state)
+        _pending_save_timer.daemon = True
+        _pending_save_timer.start()
+
+def flush_pending_save():
+    """Force any pending debounced save to happen immediately.
+    Called during shutdown so the last edit isn't lost if the debounce
+    timer hadn't fired yet."""
+    global _pending_save_timer
+    with _save_timer_lock:
+        timer = _pending_save_timer
+        _pending_save_timer = None
+    if timer is not None and timer.is_alive():
+        timer.cancel()
+        log.info("Flushing pending save on shutdown")
+        save_state()
+
 # -------------------------------------------------------
 # Temperature Sensor
 # -------------------------------------------------------
 
 def find_temp_sensor():
-    if "XXXXXXXXXXXX" not in TEMP_SENSOR_PATH:
-        return TEMP_SENSOR_PATH
-    devices = glob.glob("/sys/bus/w1/devices/28-*/w1_slave")
+    """Find the DS18B20 1-Wire sensor on the bus. Returns the w1_slave path
+    of the first 28-* device found, or None if no sensor is present.
+    Forward-compatible with sensor replacement — swap the hardware and the
+    new device is picked up automatically on next read."""
+    devices = glob.glob(TEMP_SENSOR_GLOB)
     if devices:
-        log.info(f"Auto-discovered temp sensor: {devices[0]}")
+        log.info(f"Found temp sensor: {devices[0]}")
         return devices[0]
     return None
 
@@ -604,12 +645,13 @@ def control_loop():
             if temp is None:
                 if state["sensor_unavailable_since"] is None:
                     state["sensor_unavailable_since"] = time.time()
+                    state["sensor_watchdog_fired"] = False
                     log.warning("Temp sensor unavailable — watchdog started")
-                elif state["sensor_unavailable_since"] != -1 and \
+                elif not state["sensor_watchdog_fired"] and \
                      time.time() - state["sensor_unavailable_since"] > SENSOR_UNAVAILABLE_TIMEOUT:
                     log.error("Sensor unavailable > 3 min — forcing heater off")
                     set_heater_relay(False)
-                    state["sensor_unavailable_since"] = -1
+                    state["sensor_watchdog_fired"] = True
                 mqtt_client.publish("pool/sensor/water_temp", "unavailable", retain=True)
                 publish_state()
                 update_display()
@@ -617,6 +659,7 @@ def control_loop():
                 if state["sensor_unavailable_since"] is not None:
                     log.info("Temp sensor recovered")
                     state["sensor_unavailable_since"] = None
+                    state["sensor_watchdog_fired"] = False
                 state["water_temp"] = temp
                 if state["heater_enabled"] and not state["standby"]:
                     if temp < (state["setpoint"] - HYSTERESIS):
@@ -760,7 +803,7 @@ def on_message(client, userdata, msg):
         try:
             val = float(payload)
             state["setpoint"] = max(SETPOINT_MIN, min(SETPOINT_MAX, val))
-            save_state()
+            save_state_soon()
             publish_state()
             update_display()
         except ValueError:
@@ -895,7 +938,7 @@ def encoder_cw():
         return
     state["setpoint"] = min(SETPOINT_MAX, state["setpoint"] + 1)
     log.info(f"Setpoint adjusted to {state['setpoint']}°F")
-    save_state()
+    save_state_soon()
     publish_state()
     update_display()
 
@@ -904,7 +947,7 @@ def encoder_ccw():
         return
     state["setpoint"] = max(SETPOINT_MIN, state["setpoint"] - 1)
     log.info(f"Setpoint adjusted to {state['setpoint']}°F")
-    save_state()
+    save_state_soon()
     publish_state()
     update_display()
 
@@ -1027,6 +1070,9 @@ def main():
     except Exception as e:
         log.error(f"Fatal error in main loop: {e}", exc_info=True)
     finally:
+        # Persist any pending debounced save before everything else — a setpoint
+        # change in the last 2s would otherwise be lost.
+        flush_pending_save()
         # Fail-safe: force all relays OFF on ANY exit (clean, interrupt, or crash).
         # Write pins directly rather than via set_heater_relay(), which may early-return
         # if in-memory state is stale after a crash.
